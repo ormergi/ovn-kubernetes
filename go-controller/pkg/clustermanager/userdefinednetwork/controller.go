@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	corev1informer "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -36,6 +37,7 @@ import (
 	cnitypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/controller"
 	ovntypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
 )
 
 var udnGroupVersionKind = userdefinednetworkv1.SchemeGroupVersion.WithKind("UserDefinedNetwork")
@@ -55,6 +57,8 @@ type Controller struct {
 	nadLister   netv1lister.NetworkAttachmentDefinitionLister
 
 	renderNadFn RenderNetAttachDefManifest
+
+	podInformer corev1informer.PodInformer
 }
 
 func New(
@@ -63,6 +67,7 @@ func New(
 	udnClient userdefinednetworkclientset.Interface,
 	udnInformer userdefinednetworkinformer.UserDefinedNetworkInformer,
 	renderNadFn RenderNetAttachDefManifest,
+	podInformer corev1informer.PodInformer,
 ) *Controller {
 	udnLister := udnInformer.Lister()
 	c := &Controller{
@@ -71,6 +76,7 @@ func New(
 		udnClient:   udnClient,
 		udnLister:   udnLister,
 		renderNadFn: renderNadFn,
+		podInformer: podInformer,
 	}
 	cfg := &controller.ControllerConfig[userdefinednetworkv1.UserDefinedNetwork]{
 		RateLimiter:    workqueue.DefaultControllerRateLimiter(),
@@ -154,7 +160,9 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 				ownedByUserDefinedNetwork(nad, udnGroupVersionKind, udn.UID) &&
 				controllerutil.ContainsFinalizer(nad, template.FinalizerUserDefinedNetwork) {
 
-				// TODO: verify no pod is using the NAD before removing finalizer from NAD
+				if err := c.verifyNetAttachDefNotInUse(nad); err != nil {
+					return nil, fmt.Errorf("failed to verify NAD not in use [%s/%s]: %w", nad.Namespace, nad.Name, err)
+				}
 
 				controllerutil.RemoveFinalizer(nad, template.FinalizerUserDefinedNetwork)
 				patch, err := newFinalizersReplaceJsonPatch(nad.Finalizers)
@@ -238,6 +246,30 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 	}
 
 	return nad, nil
+}
+
+func (c *Controller) verifyNetAttachDefNotInUse(nad *netv1.NetworkAttachmentDefinition) error {
+	pods, err := c.podInformer.Lister().Pods(nad.Namespace).List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("failed to list pods at target namesapce %s: %w", nad.Namespace, err)
+	}
+
+	nadName := util.GetNADName(nad.Namespace, nad.Name)
+	var connectedPods []string
+	for _, pod := range pods {
+		networkByNamespaces, err := util.UnmarshalPodAnnotationAllNetworks(pod.Annotations)
+		if err != nil && !util.IsAnnotationNotSetError(err) {
+			return fmt.Errorf("failed to filter connected pod due to unmarshal pod annotation [%s/%s]: %w", pod.Namespace, pod.Name, err)
+		}
+		if network, ok := networkByNamespaces[nadName]; ok &&
+			(network.Role == "primary" || network.Role == "secondary") {
+			connectedPods = append(connectedPods, pod.Namespace+"/"+pod.Name)
+		}
+	}
+	if len(connectedPods) > 0 {
+		return fmt.Errorf("network in use by the following pods: [%v]", connectedPods)
+	}
+	return nil
 }
 
 func newFinalizersReplaceJsonPatch(finalizers []string) ([]byte, error) {
