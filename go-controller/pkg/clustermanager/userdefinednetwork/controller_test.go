@@ -176,6 +176,30 @@ var _ = Describe("User Defined Network Controller", func() {
 			_, err = c.SyncUserDefinedNetwork(udn, mutetedNAD)
 			Expect(err).To(Equal(errors.New("foreign NetworkAttachmetDefinition with the desired name already exist")))
 		})
+
+		It("UDN with role primary, should fail when primary network NAD already exist", func() {
+			udn := testUDN()
+			udn.Spec.Role = udnv1.NetworkRolePrimary
+			c := udncontroller.New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: testNAD()})
+
+			primaryNet := primaryNetNAD()
+			Expect(nadInformer.Informer().GetIndexer().Add(primaryNet)).To(Succeed())
+
+			_, err := c.SyncUserDefinedNetwork(udn, nil)
+			Expect(err).To(MatchError(`primary network already exist in namespace "test": "primary-net-1"`))
+		})
+		It("UDN with role primary, should fail when unmarshaling existing primary network NAD fails", func() {
+			udn := testUDN()
+			udn.Spec.Role = udnv1.NetworkRolePrimary
+			c := udncontroller.New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: testNAD()})
+
+			primaryNet := primaryNetNAD()
+			primaryNet.Spec.Config = "!@#"
+			Expect(nadInformer.Informer().GetIndexer().Add(primaryNet)).To(Succeed())
+
+			_, err := c.SyncUserDefinedNetwork(udn, nil)
+			Expect(err.Error()).To(ContainSubstring(`failed to validate no primary network exist: unmarshal failed [test/primary-net-1]`))
+		})
 	})
 
 	Context("UserDefinedNetwork status update", func() {
@@ -379,4 +403,20 @@ func testNADWithDeletionTimestamp(ts time.Time) *netv1.NetworkAttachmentDefiniti
 	nad := testNAD()
 	nad.DeletionTimestamp = &metav1.Time{Time: ts}
 	return nad
+}
+
+func primaryNetNAD() *netv1.NetworkAttachmentDefinition {
+	return &netv1.NetworkAttachmentDefinition{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "k8s.cni.cncf.io/v1",
+			APIVersion: "network-attachment-definitions",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "primary-net-1",
+			Namespace: "test",
+		},
+		Spec: netv1.NetworkAttachmentDefinitionSpec{
+			Config: `{"type":"ovn-k8s-cni-overlay","role": "primary"}`,
+		},
+	}
 }
