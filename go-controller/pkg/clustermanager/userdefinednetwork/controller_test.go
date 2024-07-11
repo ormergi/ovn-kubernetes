@@ -43,12 +43,12 @@ var _ = Describe("User Defined Network Controller", func() {
 
 	Context("reconciler", func() {
 		It("should succeed", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub())
 
 			Expect(c.UserDefinedNetworkReconciler("test/test")).To(Succeed())
 		})
 		It("should fail when parsing key fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub())
 
 			Expect(c.UserDefinedNetworkReconciler("a//a")).ToNot(Succeed())
 		})
@@ -57,7 +57,7 @@ var _ = Describe("User Defined Network Controller", func() {
 	Context("UserDefinedNetwork object sync", func() {
 		It("should create NAD successfully", func() {
 			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: nad})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad))
 
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
@@ -73,7 +73,7 @@ var _ = Describe("User Defined Network Controller", func() {
 
 		It("should fail when NAD renderer fails", func() {
 			expectedError := errors.New("render error")
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{err: expectedError})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, failRenderNadStub(expectedError))
 
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
@@ -87,7 +87,7 @@ var _ = Describe("User Defined Network Controller", func() {
 			Expect(kerrors.IsNotFound(err)).To(BeTrue(), "should be not-found error")
 		})
 		It("should fail when NAD creation fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: testNAD()})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(testNAD()))
 
 			expectedError := errors.New("create NAD error")
 			nadClient.PrependReactor("create", "network-attachment-definitions", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
@@ -108,7 +108,7 @@ var _ = Describe("User Defined Network Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: nad})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad))
 
 			foreignNAD := nad.DeepCopy()
 			foreignNAD.OwnerReferences = nil
@@ -124,7 +124,7 @@ var _ = Describe("User Defined Network Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: nad})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad))
 			nad.Spec.Config = "NETCONF"
 
 			mutetedNAD := nad.DeepCopy()
@@ -143,7 +143,7 @@ var _ = Describe("User Defined Network Controller", func() {
 
 			nad := testNAD()
 			nad.Spec.Config = "NETCONF"
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: nad})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad))
 
 			mutetedNAD := nad.DeepCopy()
 			mutetedNAD.Spec.Config = "MUTATED"
@@ -166,7 +166,7 @@ var _ = Describe("User Defined Network Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{nad: nad})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad))
 
 			mutetedNAD := nad.DeepCopy()
 			mutetedNAD.ObjectMeta.OwnerReferences = []metav1.OwnerReference{{Kind: "DifferentKind"}}
@@ -185,7 +185,7 @@ var _ = Describe("User Defined Network Controller", func() {
 				udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 				Expect(err).NotTo(HaveOccurred())
 
-				c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{})
+				c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub())
 
 				Expect(c.UpdateUserDefinedNetworkStatus(udn, nad, syncErr)).To(Succeed(), "should update status successfully")
 
@@ -254,7 +254,7 @@ var _ = Describe("User Defined Network Controller", func() {
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub())
 
 			nad := testNAD()
 			syncErr := errors.New("sync error")
@@ -289,7 +289,7 @@ var _ = Describe("User Defined Network Controller", func() {
 		})
 
 		It("should fail when client update status fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, nadRendererStub{})
+			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub())
 
 			expectedError := errors.New("test err")
 			udnClient.PrependReactor("patch", "userdefinednetworks/status", func(action testing.Action) (bool, runtime.Object, error) {
@@ -312,6 +312,24 @@ func assertUserDefinedNetworkStatus(udnClient *udnfakeclient.Clientset, udn *udn
 		actualUDN.Status.Conditions[i].LastTransitionTime = metav1.Time{}
 	}
 	Expect(actualUDN.Status).To(Equal(*expectedStatus))
+}
+
+func renderNadStub(nad *netv1.NetworkAttachmentDefinition) RenderNetAttachDefManifest {
+	return newRenderNadStub(nad, nil)
+}
+
+func noopRenderNadStub() RenderNetAttachDefManifest {
+	return newRenderNadStub(nil, nil)
+}
+
+func failRenderNadStub(err error) RenderNetAttachDefManifest {
+	return newRenderNadStub(nil, err)
+}
+
+func newRenderNadStub(nad *netv1.NetworkAttachmentDefinition, err error) RenderNetAttachDefManifest {
+	return func(udn *udnv1.UserDefinedNetwork) (*netv1.NetworkAttachmentDefinition, error) {
+		return nad, err
+	}
 }
 
 type nadRendererStub struct {

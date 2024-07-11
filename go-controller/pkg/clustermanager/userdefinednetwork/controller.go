@@ -33,9 +33,7 @@ import (
 
 var udnGroupVersionKind = userdefinednetworkv1.SchemeGroupVersion.WithKind("UserDefinedNetwork")
 
-type nadRenderer interface {
-	RenderNetAttachDefManifest(*userdefinednetworkv1.UserDefinedNetwork) (*netv1.NetworkAttachmentDefinition, error)
-}
+type RenderNetAttachDefManifest func(*userdefinednetworkv1.UserDefinedNetwork) (*netv1.NetworkAttachmentDefinition, error)
 
 type Controller struct {
 	lock sync.Mutex
@@ -49,7 +47,7 @@ type Controller struct {
 	nadClient   netv1clientset.Interface
 	nadLister   netv1lister.NetworkAttachmentDefinitionLister
 
-	nadRenderer nadRenderer
+	renderNadFn RenderNetAttachDefManifest
 }
 
 func New(
@@ -57,7 +55,7 @@ func New(
 	nadInfomer netv1infomer.NetworkAttachmentDefinitionInformer,
 	udnClient userdefinednetworkclientset.Interface,
 	udnInformer userdefinednetworkinformer.UserDefinedNetworkInformer,
-	nadRenderer nadRenderer,
+	renderNadFn RenderNetAttachDefManifest,
 ) *Controller {
 	udnLister := udnInformer.Lister()
 	c := &Controller{
@@ -65,7 +63,7 @@ func New(
 		nadLister:   nadInfomer.Lister(),
 		udnClient:   udnClient,
 		udnLister:   udnLister,
-		nadRenderer: nadRenderer,
+		renderNadFn: renderNadFn,
 	}
 	cfg := &controller.ControllerConfig[userdefinednetworkv1.UserDefinedNetwork]{
 		RateLimiter:    workqueue.DefaultControllerRateLimiter(),
@@ -142,7 +140,7 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 		return nil, nil
 	}
 
-	desiredNAD, err := c.nadRenderer.RenderNetAttachDefManifest(udn)
+	desiredNAD, err := c.renderNadFn(udn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate NetworkAttachmetDefinition: %w", err)
 	}
