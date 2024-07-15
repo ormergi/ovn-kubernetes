@@ -18,6 +18,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
 	netv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	netv1clientset "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned"
 	netv1infomer "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/informers/externalversions/k8s.cni.cncf.io/v1"
@@ -145,6 +147,54 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 		return nil, nil
 	}
 
+	if !udn.DeletionTimestamp.IsZero() { // udn is being  deleted
+		if controllerutil.ContainsFinalizer(udn, template.FinalizerUserDefinedNetwork) {
+
+			if nad != nil &&
+				ownedByUserDefinedNetwork(nad, udnGroupVersionKind, udn.UID) &&
+				controllerutil.ContainsFinalizer(nad, template.FinalizerUserDefinedNetwork) {
+
+				// TODO: verify no pod is using the NAD before removing finalizer from NAD
+
+				controllerutil.RemoveFinalizer(nad, template.FinalizerUserDefinedNetwork)
+				patch, err := newFinalizersReplaceJsonPatch(nad.Finalizers)
+				if err != nil {
+					return nil, err
+				}
+				nad, err = c.nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(nad.Namespace).Patch(context.Background(), nad.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+				if err != nil {
+					return nil, err
+				}
+				klog.Infof("Finalizer removed from NetworkAttachmetDefinition [%s/%s]", nad.Namespace, nad.Name)
+			}
+
+			controllerutil.RemoveFinalizer(udn, template.FinalizerUserDefinedNetwork)
+			patch, err := newFinalizersReplaceJsonPatch(udn.Finalizers)
+			if err != nil {
+				return nil, err
+			}
+			udn, err = c.udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Patch(context.Background(), udn.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+			if err != nil {
+				return nil, err
+			}
+			klog.Infof("Finalizer removed from UserDefinedNetworks [%s/%s]", udn.Namespace, udn.Name)
+		}
+
+		return nad, nil
+	}
+
+	if finalizerAdded := controllerutil.AddFinalizer(udn, template.FinalizerUserDefinedNetwork); finalizerAdded {
+		patch, err := newFinalizersReplaceJsonPatch(udn.Finalizers)
+		if err != nil {
+			return nil, err
+		}
+		udn, err = c.udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Patch(context.Background(), udn.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
+		if err != nil {
+			return nil, err
+		}
+		klog.Infof("Added Finalizer to UserDefinedNetwork [%s/%s]", udn.Namespace, udn.Name)
+	}
+
 	desiredNAD, err := c.renderNadFn(udn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate NetworkAttachmetDefinition: %w", err)
@@ -188,6 +238,15 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 	}
 
 	return nad, nil
+}
+
+func newFinalizersReplaceJsonPatch(finalizers []string) ([]byte, error) {
+	finalizersJSON, err := json.Marshal(finalizers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal finalizers %v: %w", finalizers, err)
+	}
+	patch := []byte(fmt.Sprintf(`[{"op": "replace", "path": "/metadata/finalizers", "value": %s }]`, finalizersJSON))
+	return patch, nil
 }
 
 func validatePrimaryNetworkNadNotExist(nads []*netv1.NetworkAttachmentDefinition) error {
