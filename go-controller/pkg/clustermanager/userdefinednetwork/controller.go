@@ -198,7 +198,7 @@ func (c *Controller) SyncUserDefinedNetwork(udn *userdefinednetworkv1.UserDefine
 		}
 		udn, err = c.udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Patch(context.Background(), udn.Name, types.JSONPatchType, patch, metav1.PatchOptions{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to add finalizer to UserDefinedNetwork: %w", err)
 		}
 		klog.Infof("Added Finalizer to UserDefinedNetwork [%s/%s]", udn.Namespace, udn.Name)
 	}

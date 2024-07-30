@@ -3,14 +3,18 @@ package userdefinednetwork
 import (
 	"context"
 	"errors"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
-	corev1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	informerfactory "k8s.io/client-go/informers"
@@ -28,8 +32,6 @@ import (
 	udnfakeclient "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1/apis/clientset/versioned/fake"
 	udninformerfactory "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1/apis/informers/externalversions"
 	udninformer "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1/apis/informers/externalversions/userdefinednetwork/v1"
-
-	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
 )
 
 var _ = Describe("User Defined Network Controller", func() {
@@ -38,6 +40,8 @@ var _ = Describe("User Defined Network Controller", func() {
 		nadClient   *netv1fakeclientset.Clientset
 		udnInformer udninformer.UserDefinedNetworkInformer
 		nadInformer netv1Informer.NetworkAttachmentDefinitionInformer
+
+		kubeClient  *fake.Clientset
 		podInformer corev1informer.PodInformer
 	)
 
@@ -46,130 +50,331 @@ var _ = Describe("User Defined Network Controller", func() {
 		udnInformer = udninformerfactory.NewSharedInformerFactory(udnClient, 15).K8s().V1().UserDefinedNetworks()
 		nadClient = netv1fakeclientset.NewSimpleClientset()
 		nadInformer = netv1informerfactory.NewSharedInformerFactory(nadClient, 15).K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
-		kubeClient := fake.NewSimpleClientset()
-		sharedInformer := informerfactory.NewSharedInformerFactoryWithOptions(kubeClient, 15)
-		podInformer = sharedInformer.Core().V1().Pods()
+
+		kubeClient = fake.NewSimpleClientset()
+		podInFact := informerfactory.NewSharedInformerFactoryWithOptions(kubeClient, 15)
+		podInformer = podInFact.Core().V1().Pods()
 	})
 
-	Context("reconciler", func() {
-		It("should succeed", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub(), podInformer)
+	Context("controller", func() {
+		var f *factory.WatchFactory
 
-			Expect(c.UserDefinedNetworkReconciler("test/test")).To(Succeed())
+		BeforeEach(func() {
+			// Restore global default values before each testcase
+			Expect(config.PrepareTestConfig()).To(Succeed())
+			config.OVNKubernetesFeature.EnableMultiNetwork = true
+			config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+
+			fakeClient := &util.OVNClusterManagerClientset{
+				KubeClient:               kubeClient,
+				NetworkAttchDefClient:    nadClient,
+				UserDefinedNetworkClient: udnClient,
+			}
+			var err error
+			f, err = factory.NewClusterManagerWatchFactory(fakeClient)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.Start()).To(Succeed())
+
 		})
-		It("should fail when parsing key fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub(), podInformer)
-
-			Expect(c.UserDefinedNetworkReconciler("a//a")).ToNot(Succeed())
+		AfterEach(func() {
+			f.Shutdown()
 		})
-	})
 
-	Context("UserDefinedNetwork object sync", func() {
 		It("should create NAD successfully", func() {
-			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad), nil)
-
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			_, err = c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).ToNot(HaveOccurred())
+			expectedNAD := testNAD()
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), renderNadStub(expectedNAD), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
 
-			actualNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(udn.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "True",
+				Reason:  "NetworkAttachmentDefinitionReady",
+				Message: "NetworkAttachmentDefinition has been created",
+			}}))
+
+			nad, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(actualNAD).To(Equal(nad))
+
+			Expect(nad).To(Equal(expectedNAD))
 		})
 
-		It("should fail when NAD renderer fails", func() {
-			expectedError := errors.New("render error")
-			c := New(nadClient, nadInformer, udnClient, udnInformer, failRenderNadStub(expectedError), nil)
-
+		It("should fail when NAD render fail", func() {
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			_, err = c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).To(HaveOccurred())
-			Expect(err).To(MatchError(expectedError))
+			renderErr := errors.New("render NAD fails")
+
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), failRenderNadStub(renderErr), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(udn.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: "failed to generate NetworkAttachmetDefinition: " + renderErr.Error(),
+			}}))
 
 			_, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
-			Expect(kerrors.IsNotFound(err)).To(BeTrue(), "should be not-found error")
+			Expect(kerrors.IsNotFound(err)).To(BeTrue())
 		})
-		It("should fail when NAD creation fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(testNAD()), nil)
+		It("should fail when NAD create fail", func() {
+			udn := testUDN()
+			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
 
 			expectedError := errors.New("create NAD error")
 			nadClient.PrependReactor("create", "network-attachment-definitions", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
 				return true, nil, expectedError
 			})
 
-			udn := testUDN()
-			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
-			Expect(err).NotTo(HaveOccurred())
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
 
-			_, err = c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).To(MatchError(expectedError), "should fail due to client error")
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return udn.Status.Conditions
+			}).ShouldNot(BeEmpty())
+
+			Expect(normalizeConditions(udn.Status.Conditions)).To(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: "failed to create NetworkAttachmetDefinition: create NAD error",
+			}}))
+
+			_, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+			Expect(kerrors.IsNotFound(err)).To(BeTrue())
 		})
 
-		It("should fail when foreign NAD exist (foreign NAD - same name, not created by the controller)", func() {
+		It("should fail when foreign NAD exist", func() {
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad), nil)
-
-			foreignNAD := nad.DeepCopy()
-			foreignNAD.OwnerReferences = nil
-			foreignNAD, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Create(context.Background(), foreignNAD, metav1.CreateOptions{})
+			foreignNad := testNAD()
+			foreignNad.ObjectMeta.OwnerReferences = nil
+			foreignNad, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Create(context.Background(), foreignNad, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			_, err = c.SyncUserDefinedNetwork(udn, foreignNAD)
-			Expect(err).To(Equal(errors.New("foreign NetworkAttachmetDefinition with the desired name already exist")))
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return udn.Status.Conditions
+			}).ShouldNot(BeEmpty())
+
+			Expect(normalizeConditions(udn.Status.Conditions)).To(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: "foreign NetworkAttachmetDefinition with the desired name already exist",
+			}}))
 		})
 		It("should reconcile mutated NAD", func() {
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			nad := testNAD()
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad), nil)
-			nad.Spec.Config = "NETCONF"
+			expectedNAD := testNAD()
 
-			mutetedNAD := nad.DeepCopy()
-			mutetedNAD.Spec.Config = "MUTATED"
-			mutetedNAD, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Create(context.Background(), mutetedNAD, metav1.CreateOptions{})
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), renderNadStub(expectedNAD), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return udn.Status.Conditions
+			}).ShouldNot(BeEmpty())
+			Expect(normalizeConditions(udn.Status.Conditions)).To(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "True",
+				Reason:  "NetworkAttachmentDefinitionReady",
+				Message: "NetworkAttachmentDefinition has been created",
+			}}))
+
+			mutatedNAD := expectedNAD.DeepCopy()
+			p := []byte(`[{"op":"replace","path":"/spec/config","value":"MUTATED"}]`)
+			mutatedNAD, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Patch(context.Background(), mutatedNAD.Name, types.JSONPatchType, p, metav1.PatchOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			_, err = c.SyncUserDefinedNetwork(udn, mutetedNAD)
-
-			Expect(mutetedNAD).To(Equal(nad))
+			Eventually(func() *netv1.NetworkAttachmentDefinition {
+				updatedNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return updatedNAD
+			}).Should(Equal(expectedNAD))
 		})
-		It("should fail when updating mutated NAD fails", func() {
+		It("should fail when update mutated NAD fails", func() {
+			expectedNAD := testNAD()
+
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			nad := testNAD()
-			nad.Spec.Config = "NETCONF"
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(nad), nil)
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), renderNadStub(expectedNAD), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
 
-			mutetedNAD := nad.DeepCopy()
-			mutetedNAD.Spec.Config = "MUTATED"
-			mutetedNAD, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Create(context.Background(), mutetedNAD, metav1.CreateOptions{})
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return udn.Status.Conditions
+			}).ShouldNot(BeEmpty())
+			Expect(normalizeConditions(udn.Status.Conditions)).To(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "True",
+				Reason:  "NetworkAttachmentDefinitionReady",
+				Message: "NetworkAttachmentDefinition has been created",
+			}}))
+
+			actualNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(actualNAD).To(Equal(expectedNAD))
 
 			expectedErr := errors.New("update error")
 			nadClient.PrependReactor("update", "network-attachment-definitions", func(action testing.Action) (bool, runtime.Object, error) {
 				return true, nil, expectedErr
 			})
 
-			_, err = c.SyncUserDefinedNetwork(udn, mutetedNAD)
+			mutatedNAD := expectedNAD.DeepCopy()
+			p := []byte(`[{"op":"replace","path":"/spec/config","value":"MUTATED"}]`)
+			mutatedNAD, err = nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Patch(context.Background(), mutatedNAD.Name, types.JSONPatchType, p, metav1.PatchOptions{})
+			Expect(err).NotTo(HaveOccurred())
 
-			Expect(err).To(MatchError(expectedErr))
+			Eventually(func() []metav1.Condition {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(udn.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: "failed to update NetworkAttachmetDefinition: " + expectedErr.Error(),
+			}}))
+
+			Eventually(func() *netv1.NetworkAttachmentDefinition {
+				updatedNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return updatedNAD
+			}).Should(Equal(mutatedNAD))
 		})
 
+		It("given primary UDN, should fail when primary NAD already exist", func() {
+			targetNs := "test"
+
+			primaryNAD := primaryNetNAD()
+			primaryNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(targetNs).Create(context.Background(), primaryNAD, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			primaryUDN := testUDN()
+			primaryUDN.Spec.Role = udnv1.NetworkRolePrimary
+			primaryUDN, err = udnClient.K8sV1().UserDefinedNetworks(targetNs).Create(context.Background(), primaryUDN, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				updatedUDN, err := udnClient.K8sV1().UserDefinedNetworks(primaryUDN.Namespace).Get(context.Background(), primaryUDN.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(updatedUDN.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: `primary network already exist in namespace "test": "primary-net-1"`,
+			}}))
+		})
+		It("given primary UDN, should fail when unmarshal primary NAD fails", func() {
+			targetNs := "test"
+
+			primaryNAD := primaryNetNAD()
+			primaryNAD.Name = "another-primary-net"
+			primaryNAD.Spec.Config = "!@#$"
+			primaryNAD, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(targetNs).Create(context.Background(), primaryNAD, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			primaryUDN := testUDN()
+			primaryUDN.Spec.Role = udnv1.NetworkRolePrimary
+			primaryUDN, err = udnClient.K8sV1().UserDefinedNetworks(targetNs).Create(context.Background(), primaryUDN, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				updatedUDN, err := udnClient.K8sV1().UserDefinedNetworks(primaryUDN.Namespace).Get(context.Background(), primaryUDN.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(updatedUDN.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: `failed to validate no primary network exist: unmarshal failed [test/another-primary-net]: invalid character '!' looking for beginning of value`,
+			}}))
+		})
+
+		It("should add finalizer to UDN", func() {
+			udn := testUDN()
+			udn.Finalizers = nil
+			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []string {
+				udn, err = udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return udn.Finalizers
+			}).Should(Equal([]string{"k8s.ovn.org/user-defined-network-protection"}))
+		})
+
+		It("should fail when add finalizer to UDN fails", func() {
+			udn := testUDN()
+			udn.Finalizers = nil
+			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			expectedErr := errors.New("patch error")
+			udnClient.PrependReactor("patch", "userdefinednetworks", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
+				if action.GetSubresource() == "status" {
+					return handled, obj, err
+				}
+				return true, nil, expectedErr
+			})
+
+			c := New(nadClient, f.NADInformer(), udnClient, f.UserDefinedNetworkInformer(), noopRenderNadStub(), f.PodCoreInformer())
+			Expect(c.Run()).To(Succeed())
+
+			Eventually(func() []metav1.Condition {
+				updatedUDN, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				return normalizeConditions(updatedUDN.Status.Conditions)
+			}).Should(Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "False",
+				Reason:  "SyncError",
+				Message: `failed to add finalizer to UserDefinedNetwork: patch error`,
+			}}))
+		})
+	})
+
+	Context("sync", func() {
 		It("should fail when NAD owner-reference is malformed", func() {
 			udn := testUDN()
 			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
@@ -187,58 +392,6 @@ var _ = Describe("User Defined Network Controller", func() {
 			Expect(err).To(Equal(errors.New("foreign NetworkAttachmetDefinition with the desired name already exist")))
 		})
 
-		It("UDN with role primary, should fail when primary network NAD already exist", func() {
-			udn := testUDN()
-			udn.Spec.Role = udnv1.NetworkRolePrimary
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(testNAD()), nil)
-
-			primaryNet := primaryNetNAD()
-			Expect(nadInformer.Informer().GetIndexer().Add(primaryNet)).To(Succeed())
-
-			_, err := c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).To(MatchError(`primary network already exist in namespace "test": "primary-net-1"`))
-		})
-		It("UDN with role primary, should fail when unmarshaling existing primary network NAD fails", func() {
-			udn := testUDN()
-			udn.Spec.Role = udnv1.NetworkRolePrimary
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(testNAD()), nil)
-
-			primaryNet := primaryNetNAD()
-			primaryNet.Spec.Config = "!@#"
-			Expect(nadInformer.Informer().GetIndexer().Add(primaryNet)).To(Succeed())
-
-			_, err := c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err.Error()).To(ContainSubstring(`failed to validate no primary network exist: unmarshal failed [test/primary-net-1]`))
-		})
-
-		It("should add finalizer to UDN if not exist", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, renderNadStub(testNAD()), podInformer)
-
-			udn := testUDN()
-			udn.Finalizers = nil
-			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(udn.Finalizers).To(Equal([]string{"k8s.ovn.org/user-defined-network-protection"}))
-		})
-		It("should fail adding finalizer to UDN when patch fails", func() {
-			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub(), podInformer)
-
-			udn := testUDN()
-			udn.Finalizers = nil
-			udn, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Create(context.Background(), udn, metav1.CreateOptions{})
-			Expect(err).NotTo(HaveOccurred())
-
-			expectedErr := errors.New("patch error")
-			udnClient.PrependReactor("patch", "userdefinednetworks", func(action testing.Action) (bool, runtime.Object, error) {
-				return true, nil, expectedErr
-			})
-
-			_, err = c.SyncUserDefinedNetwork(udn, nil)
-			Expect(err).To(MatchError(expectedErr))
-		})
 		It("when udn is being deleted, should not remove finalizer from non managed NAD", func() {
 			c := New(nadClient, nadInformer, udnClient, udnInformer, noopRenderNadStub(), podInformer)
 
@@ -428,7 +581,7 @@ var _ = Describe("User Defined Network Controller", func() {
 		)
 	})
 
-	Context("UserDefinedNetwork status update", func() {
+	Context("status update", func() {
 		DescribeTable("should update status, when",
 			func(nad *netv1.NetworkAttachmentDefinition, syncErr error, expectedStatus *udnv1.UserDefinedNetworkStatus) {
 				udn := testUDN()
@@ -553,6 +706,14 @@ var _ = Describe("User Defined Network Controller", func() {
 	})
 })
 
+func normalizeConditions(conditions []metav1.Condition) []metav1.Condition {
+	for i := range conditions {
+		t := metav1.NewTime(time.Time{})
+		conditions[i].LastTransitionTime = t
+	}
+	return conditions
+}
+
 func assertUserDefinedNetworkStatus(udnClient *udnfakeclient.Clientset, udn *udnv1.UserDefinedNetwork, expectedStatus *udnv1.UserDefinedNetworkStatus) {
 	actualUDN, err := udnClient.K8sV1().UserDefinedNetworks(udn.Namespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
@@ -612,8 +773,8 @@ func testsUDNWithDeletionTimestamp(ts time.Time) *udnv1.UserDefinedNetwork {
 func testNAD() *netv1.NetworkAttachmentDefinition {
 	return &netv1.NetworkAttachmentDefinition{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "k8s.cni.cncf.io/v1",
-			APIVersion: "network-attachment-definitions",
+			APIVersion: "k8s.cni.cncf.io/v1",
+			Kind:       "NetworkAttachmentDefinition",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
@@ -627,6 +788,7 @@ func testNAD() *netv1.NetworkAttachmentDefinition {
 					Name:               "test",
 					UID:                "1",
 					BlockOwnerDeletion: pointer.Bool(true),
+					Controller:         pointer.Bool(true),
 				},
 			},
 		},

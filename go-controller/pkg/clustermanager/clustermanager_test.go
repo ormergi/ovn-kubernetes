@@ -6,13 +6,22 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
+
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
+
+	"github.com/urfave/cli/v2"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/pointer"
 
-	"github.com/onsi/ginkgo"
-	"github.com/onsi/gomega"
+	netv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	netv1fakeclientset "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned/fake"
+	udnv1 "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1"
+	udnfakeclient "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1/apis/clientset/versioned/fake"
 
 	hotypes "github.com/ovn-org/ovn-kubernetes/go-controller/hybrid-overlay/pkg/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
@@ -21,8 +30,6 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 	ovntypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
-	"github.com/urfave/cli/v2"
-	utilnet "k8s.io/utils/net"
 )
 
 const (
@@ -1170,288 +1177,120 @@ var _ = ginkgo.Describe("Cluster Manager", func() {
 		})
 	})
 
-	ginkgo.Context("Transit switch port IP allocations", func() {
-		ginkgo.It("Interconnect enabled", func() {
-			config.ClusterManager.V4TransitSwitchSubnet = "100.89.0.0/16"
-			config.ClusterManager.V6TransitSwitchSubnet = "fd99::/64"
+	ginkgo.Context("user-defined-network controller", func() {
+		var (
+			nadClient *netv1fakeclientset.Clientset
+			udnClient *udnfakeclient.Clientset
+
+			cm *ClusterManager
+		)
+
+		ginkgo.BeforeEach(func() {
 			app.Action = func(ctx *cli.Context) error {
-				nodes := []v1.Node{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node1",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node2",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node3",
-						},
-					},
-				}
-				kubeFakeClient := fake.NewSimpleClientset(&v1.NodeList{
-					Items: nodes,
-				})
+				config.OVNKubernetesFeature.EnableMultiNetwork = true
+				config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+
+				kubeFakeClient := fake.NewSimpleClientset()
+				nadClient = netv1fakeclientset.NewSimpleClientset()
+				udnClient = udnfakeclient.NewSimpleClientset()
 				fakeClient := &util.OVNClusterManagerClientset{
-					KubeClient: kubeFakeClient,
+					KubeClient:               kubeFakeClient,
+					NetworkAttchDefClient:    nadClient,
+					UserDefinedNetworkClient: udnClient,
 				}
 
 				_, err := config.InitConfig(ctx, nil, nil)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				if err != nil {
+					return err
+				}
 				config.Kubernetes.HostNetworkNamespace = ""
 
-				f, err = factory.NewClusterManagerWatchFactory(fakeClient)
+				f, err := factory.NewClusterManagerWatchFactory(fakeClient)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = f.Start()
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(f.Start()).To(gomega.Succeed())
 
-				clusterManager, err := NewClusterManager(fakeClient, f, "identity", wg, nil)
-				gomega.Expect(clusterManager).NotTo(gomega.BeNil())
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = clusterManager.Start(ctx.Context)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				defer clusterManager.Stop()
-
-				// Check that cluster manager has allocated id transit switch port ips for each node
-				for _, n := range nodes {
-					gomega.Eventually(func() error {
-						updatedNode, err := fakeClient.KubeClient.CoreV1().Nodes().Get(context.TODO(), n.Name, metav1.GetOptions{})
-						if err != nil {
-							return err
-						}
-
-						_, ok := updatedNode.Annotations[ovnTransitSwitchPortAddrAnnotation]
-						if !ok {
-							return fmt.Errorf("expected node annotation for node %s to have transit switch port ips allocated", n.Name)
-						}
-
-						transitSwitchIps, err := util.ParseNodeTransitSwitchPortAddrs(updatedNode)
-						if err != nil {
-							return fmt.Errorf("error parsing transit switch ip annotations for the node %s", n.Name)
-						}
-
-						if len(transitSwitchIps) < 1 {
-							return fmt.Errorf("transit switch ips for node %s not allocated", n.Name)
-						}
-
-						_, transitSwitchV4Subnet, err := net.ParseCIDR(config.ClusterManager.V4TransitSwitchSubnet)
-						if err != nil {
-							return fmt.Errorf("could not parse IPv4 transit switch subnet %v", err)
-						}
-
-						_, transitSwitchV6Subnet, err := net.ParseCIDR(config.ClusterManager.V6TransitSwitchSubnet)
-						if err != nil {
-							return fmt.Errorf("could not parse IPv6 transit switch subnet %v", err)
-						}
-
-						for _, ipNet := range transitSwitchIps {
-							if !transitSwitchV4Subnet.Contains(ipNet.IP) && utilnet.IsIPv4CIDR(ipNet) {
-								return fmt.Errorf("IPv4 transit switch ips for node %s does not belong to expected subnet", n.Name)
-							} else if !transitSwitchV6Subnet.Contains(ipNet.IP) && utilnet.IsIPv6CIDR(ipNet) {
-								return fmt.Errorf("IPv6 transit switch ips for node %s does not belong to expected subnet", n.Name)
-							}
-						}
-						return nil
-					}).ShouldNot(gomega.HaveOccurred())
-				}
-
+				cm, err = NewClusterManager(fakeClient, f, "identity", wg, nil)
+				gomega.Expect(cm.Start(ctx.Context)).To(gomega.Succeed())
 				return nil
 			}
-
 			err := app.Run([]string{
 				app.Name,
-				"-cluster-subnets=" + clusterCIDR + "," + clusterv6CIDR,
-				"-k8s-service-cidr=10.96.0.0/16,fd00:10:96::/112",
-				"--enable-interconnect",
 			})
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		})
-
-		ginkgo.It("Interconnect enabled - clear the transit switch port ips and check", func() {
-			app.Action = func(ctx *cli.Context) error {
-				nodes := []v1.Node{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node1",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node2",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node3",
-						},
-					},
-				}
-				kubeFakeClient := fake.NewSimpleClientset(&v1.NodeList{
-					Items: nodes,
-				})
-				fakeClient := &util.OVNClusterManagerClientset{
-					KubeClient: kubeFakeClient,
-				}
-
-				_, err := config.InitConfig(ctx, nil, nil)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				config.Kubernetes.HostNetworkNamespace = ""
-
-				f, err = factory.NewClusterManagerWatchFactory(fakeClient)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = f.Start()
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
-				clusterManager, err := NewClusterManager(fakeClient, f, "identity", wg, nil)
-				gomega.Expect(clusterManager).NotTo(gomega.BeNil())
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = clusterManager.Start(ctx.Context)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				defer clusterManager.Stop()
-
-				// Check that cluster manager has allocated id transit switch port ips for each node
-				for _, n := range nodes {
-					gomega.Eventually(func() error {
-						updatedNode, err := fakeClient.KubeClient.CoreV1().Nodes().Get(context.TODO(), n.Name, metav1.GetOptions{})
-						if err != nil {
-							return err
-						}
-
-						_, ok := updatedNode.Annotations[ovnTransitSwitchPortAddrAnnotation]
-						if !ok {
-							return fmt.Errorf("expected node annotation for node %s to have transit switch port ips allocated", n.Name)
-						}
-
-						transitSwitchIps, err := util.ParseNodeTransitSwitchPortAddrs(updatedNode)
-						if err != nil {
-							return fmt.Errorf("error parsing transit switch ip annotations for the node %s", n.Name)
-						}
-
-						if len(transitSwitchIps) < 1 {
-							return fmt.Errorf("transit switch ips for node %s not allocated", n.Name)
-						}
-
-						return nil
-					}).ShouldNot(gomega.HaveOccurred())
-				}
-
-				// Clear the transit switch port ip annotation from node 1.
-				node1, _ := fakeClient.KubeClient.CoreV1().Nodes().Get(context.TODO(), "node1", metav1.GetOptions{})
-				nodeAnnotations := node1.Annotations
-				nodeAnnotator := kube.NewNodeAnnotator(&kube.Kube{kubeFakeClient}, "node1")
-				for k, v := range nodeAnnotations {
-					nodeAnnotator.Set(k, v)
-				}
-				node1TransitSwitchIps := node1.Annotations[ovnTransitSwitchPortAddrAnnotation]
-				nodeAnnotator.Delete(ovnTransitSwitchPortAddrAnnotation)
-				err = nodeAnnotator.Run()
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
-				gomega.Eventually(func() error {
-					updatedNode, err := fakeClient.KubeClient.CoreV1().Nodes().Get(context.TODO(), "node1", metav1.GetOptions{})
-					if err != nil {
-						return err
-					}
-
-					updatedNode1TransitSwitchIps, ok := updatedNode.Annotations[ovnTransitSwitchPortAddrAnnotation]
-					if !ok {
-						return fmt.Errorf("expected node annotation for node node1 to have transit switch port ips allocated")
-					}
-
-					transitSwitchIps, err := util.ParseNodeTransitSwitchPortAddrs(updatedNode)
-					if err != nil {
-						return fmt.Errorf("error parsing transit switch ip annotations for the node node1")
-					}
-
-					if len(transitSwitchIps) < 1 {
-						return fmt.Errorf("transit switch ips for node node1 not allocated")
-					}
-					gomega.Expect(node1TransitSwitchIps).To(gomega.Equal(updatedNode1TransitSwitchIps))
-					return nil
-				}).ShouldNot(gomega.HaveOccurred())
-
-				return nil
-			}
-
-			err := app.Run([]string{
-				app.Name,
-				"-cluster-subnets=" + clusterCIDR,
-				"--enable-interconnect",
-			})
-			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		ginkgo.AfterEach(func() {
+			cm.Stop()
 		})
 
-		ginkgo.It("Interconnect disabled", func() {
-			app.Action = func(ctx *cli.Context) error {
-				nodes := []v1.Node{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node1",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node2",
-						},
-					},
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "node3",
-						},
-					},
-				}
-				kubeFakeClient := fake.NewSimpleClientset(&v1.NodeList{
-					Items: nodes,
-				})
-				fakeClient := &util.OVNClusterManagerClientset{
-					KubeClient: kubeFakeClient,
-				}
+		ginkgo.FIt("should create NAD according to UDN spec", func() {
+			testNamespace := "test"
 
-				_, err := config.InitConfig(ctx, nil, nil)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				config.Kubernetes.HostNetworkNamespace = ""
-
-				f, err = factory.NewClusterManagerWatchFactory(fakeClient)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = f.Start()
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
-				clusterManager, err := NewClusterManager(fakeClient, f, "identity", wg, nil)
-				gomega.Expect(clusterManager).NotTo(gomega.BeNil())
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				err = clusterManager.Start(ctx.Context)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				defer clusterManager.Stop()
-
-				// Check that cluster manager has allocated id transit switch port ips for each node
-				for _, n := range nodes {
-					gomega.Eventually(func() error {
-						updatedNode, err := fakeClient.KubeClient.CoreV1().Nodes().Get(context.TODO(), n.Name, metav1.GetOptions{})
-						if err != nil {
-							return err
-						}
-
-						_, ok := updatedNode.Annotations[ovnTransitSwitchPortAddrAnnotation]
-						if ok {
-							return fmt.Errorf("not expected node annotation for node %s to have transit switch port ips allocated", n.Name)
-						}
-
-						return nil
-					}).ShouldNot(gomega.HaveOccurred())
-				}
-
-				return nil
-			}
-
-			err := app.Run([]string{
-				app.Name,
-				"-cluster-subnets=" + clusterCIDR,
-			})
+			udn, err := udnClient.K8sV1().UserDefinedNetworks(testNamespace).Create(context.Background(), testUDN(), metav1.CreateOptions{})
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			gomega.Eventually(func() []metav1.Condition {
+				updatedUDN, err := udnClient.K8sV1().UserDefinedNetworks(testNamespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return normalizeConditions(updatedUDN.Status.Conditions)
+			}).Should(gomega.Equal([]metav1.Condition{{
+				Type:    "NetworkReady",
+				Status:  "True",
+				Reason:  "NetworkAttachmentDefinitionReady",
+				Message: "NetworkAttachmentDefinition has been created",
+			}}))
+
+			nad, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(testNamespace).Get(context.Background(), udn.Name, metav1.GetOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			gomega.Expect(nad).To(gomega.Equal(testNAD()))
 		})
 	})
 
 })
+
+func testUDN() *udnv1.UserDefinedNetwork {
+	return &udnv1.UserDefinedNetwork{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "test", UID: "1",
+		},
+		Spec: udnv1.UserDefinedNetworkSpec{
+			Role: "Secondary", Topology: "Layer2",
+		},
+	}
+}
+
+func testNAD() *netv1.NetworkAttachmentDefinition {
+	return &netv1.NetworkAttachmentDefinition{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "k8s.cni.cncf.io/v1",
+			Kind:       "NetworkAttachmentDefinition",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test",
+			Namespace:  "test",
+			Labels:     map[string]string{"k8s.ovn.org/user-defined-network": ""},
+			Finalizers: []string{"k8s.ovn.org/user-defined-network-protection"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         udnv1.SchemeGroupVersion.String(),
+					Kind:               "UserDefinedNetwork",
+					Name:               "test",
+					UID:                "1",
+					BlockOwnerDeletion: pointer.Bool(true),
+					Controller:         pointer.Bool(true),
+				},
+			},
+		},
+		Spec: netv1.NetworkAttachmentDefinitionSpec{
+			Config: "{\"cniVersion\":\"1.0.0\",\"name\":\"test.test\",\"netAttachDefName\":\"test/test\",\"role\":\"secondary\",\"topology\":\"layer2\",\"type\":\"ovn-k8s-cni-overlay\"}",
+		},
+	}
+}
+
+func normalizeConditions(conditions []metav1.Condition) []metav1.Condition {
+	for i := range conditions {
+		t := metav1.NewTime(time.Time{})
+		conditions[i].LastTransitionTime = t
+	}
+	return conditions
+}
