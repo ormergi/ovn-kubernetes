@@ -48,6 +48,7 @@ type NetworkSpec struct {
 	// Layer2 topology creates one logical switch shared by all nodes.
 	// Localnet topology attach to the overlay local network. Enables egress to the provider's physical network.
 	//
+	// +kubebuilder:validation:Enum=Layer2;Layer3;Localnet
 	// +kubebuilder:validation:Required
 	// +required
 	// +unionDiscriminator
