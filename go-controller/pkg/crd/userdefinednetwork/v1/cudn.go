@@ -85,6 +85,8 @@ type ClusterUserDefinedNetworkList struct {
 	Items           []ClusterUserDefinedNetwork `json:"items"`
 }
 
+const NetworkTopologyLocalnet NetworkTopology = "Localnet"
+
 // +kubebuilder:validation:XValidation:rule="has(self.ipam) && has(self.ipam.mode) && self.ipam.mode != 'Enabled' || has(self.subnets)", message="subnets is required with ipam.mode is Enabled or unset"
 // +kubebuilder:validation:XValidation:rule="!has(self.ipam) || !has(self.ipam.mode) || self.ipam.mode != 'Disabled' || !has(self.subnets)", message="subnets must be unset when ipam.mode is Disabled"
 // +kubebuilder:validation:XValidation:rule="!has(self.excludeSubnets) || has(self.excludeSubnets) && has(self.subnets)", message="excludeSubnets must be unset when subents is unset"
