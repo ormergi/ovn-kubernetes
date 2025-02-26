@@ -1746,6 +1746,10 @@ var _ = Describe("Multi Homing", func() {
 	})
 
 	It("using ClusterUserDefinedNetwork CR, pods in different namespaces & different nodes, should be able to communicate over Localnet topology", func() {
+		if !isNetworkSegmentationEnabled() {
+			Skip("skip test because it require ClusterUserDefinedNetwork CR installed")
+		}
+
 		const vlan = 200
 		const subnetIPv4 = "192.168.100.0/24"
 		const subnetIPv6 = "2001:dbb::/64"
