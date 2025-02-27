@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -eo pipefail
+set -xeo pipefail
 
 # Returns the full directory name of the script
 export DIR="$( cd -- "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
@@ -18,6 +18,8 @@ set_default_params() {
   export KIND_INSTALL_METALLB=${KIND_INSTALL_METALLB:-false}
   export KIND_INSTALL_PLUGINS=${KIND_INSTALL_PLUGINS:-false}
   export KIND_INSTALL_KUBEVIRT=${KIND_INSTALL_KUBEVIRT:-false}
+  export KIND_IMAGE=${KIND_IMAGE:-kindest/node}
+  export K8S_VERSION=${K8S_VERSION:-v1.31.1}
   export OVN_HA=${OVN_HA:-false}
   export OVN_MULTICAST_ENABLE=${OVN_MULTICAST_ENABLE:-false}
   export OVN_HYBRID_OVERLAY_ENABLE=${OVN_HYBRID_OVERLAY_ENABLE:-false}
@@ -95,6 +97,7 @@ usage() {
     echo "       [ -pl  | --install-cni-plugins ]"
     echo "       [ -ikv | --install-kubevirt ]"
     echo "       [ -mne | --multi-network-enable ]"
+    echo "       [ -nse | --network-segmentation-enable ]"
     echo "       [ -wk  | --num-workers <num> ]"
     echo "       [ -ic  | --enable-interconnect]"
     echo "       [ -npz | --node-per-zone ]"
@@ -115,6 +118,7 @@ usage() {
     echo "-pl  | --install-cni-plugins        Install CNI plugins"
     echo "-ikv | --install-kubevirt           Install kubevirt"
     echo "-mne | --multi-network-enable       Enable multi networks. DEFAULT: Disabled"
+    echo "-nse | --network-segmentation-enable Enable network segmentation. DEFAULT: Disabled"
     echo "-ha  | --ha-enabled                 Enable high availability. DEFAULT: HA Disabled"
     echo "-wk  | --num-workers                Number of worker nodes. DEFAULT: 2 workers"
     echo "-cn  | --cluster-name               Configure the kind cluster's name"
@@ -158,6 +162,8 @@ parse_args() {
             -ikv | --install-kubevirt)          KIND_INSTALL_KUBEVIRT=true
                                                 ;;
             -mne | --multi-network-enable )     ENABLE_MULTI_NET=true
+                                                ;;
+            -nse | --network-segmentation-enable )     ENABLE_NETWORK_SEGMENTATION=true
                                                 ;;
             -ha | --ha-enabled )                OVN_HA=true
                                                 KIND_NUM_MASTER=3
@@ -211,6 +217,7 @@ print_params() {
      echo "KIND_CLUSTER_NAME = $KIND_CLUSTER_NAME"
      echo "KIND_REMOVE_TAINT = $KIND_REMOVE_TAINT"
      echo "ENABLE_MULTI_NET = $ENABLE_MULTI_NET"
+     echo "ENABLE_NETWORK_SEGMENTATION = $ENABLE_NETWORK_SEGMENTATION"
      echo "OVN_IMAGE = $OVN_IMAGE"
      echo "KIND_NUM_MASTER = $KIND_NUM_MASTER"
      echo "KIND_NUM_WORKER = $KIND_NUM_WORKER"
@@ -320,7 +327,7 @@ networking:
 EOT
 
     kind delete clusters $KIND_CLUSTER_NAME ||:
-    kind create cluster --name $KIND_CLUSTER_NAME --config "${KIND_CONFIG}" --retain
+    kind create cluster --name $KIND_CLUSTER_NAME --config "${KIND_CONFIG}" --image "${KIND_IMAGE}":"${K8S_VERSION}" --retain
     kind load docker-image --name $KIND_CLUSTER_NAME $OVN_IMAGE
 
     # When using HA, label nodes to host db.
@@ -402,6 +409,7 @@ create_ovn_kubernetes() {
           --set global.enableAdminNetworkPolicy=true \
           --set global.enableMulticast=$(if [ "${OVN_MULTICAST_ENABLE}" == "true" ]; then echo "true"; else echo "false"; fi) \
           --set global.enableMultiNetwork=$(if [ "${ENABLE_MULTI_NET}" == "true" ]; then echo "true"; else echo "false"; fi) \
+          --set global.enableNetworkSegmentation=$(if [ "${ENABLE_NETWORK_SEGMENTATION}" == "true" ]; then echo "true"; else echo "false"; fi) \
           --set global.enableHybridOverlay=$(if [ "${OVN_HYBRID_OVERLAY_ENABLE}" == "true" ]; then echo "true"; else echo "false"; fi) \
           --set global.enableObservability=$(if [ "${OVN_OBSERV_ENABLE}" == "true" ]; then echo "true"; else echo "false"; fi) \
         --set global.emptyLbEvents=$(if [ "${OVN_EMPTY_LB_EVENTS}" == "true" ]; then echo "true"; else echo "false"; fi) \
@@ -429,7 +437,9 @@ set_default_params
 print_params
 helm_prereqs
 build_ovn_image
-create_kind_cluster
+if [ $KIND_CREATE == "false" ]; then
+  create_kind_cluster
+fi
 detect_apiserver_url
 docker_disable_ipv6
 coredns_patch
@@ -449,6 +459,10 @@ if [ "$KIND_INSTALL_INGRESS" == true ]; then
 fi
 
 if [ "$ENABLE_MULTI_NET" == true ]; then
+  enable_multi_net
+fi
+
+if [ "$ENABLE_NETWORK_SEGMENTATION" == true ]; then
   enable_multi_net
 fi
 

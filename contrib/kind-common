@@ -451,6 +451,16 @@ enable_multi_net() {
   docker_create_second_disconnected_interface "underlay"  # localnet scenarios require an extra interface
 }
 
+enable_net_segmentation() {
+  echo "Installing UserDefinedNetwork CRD..."
+  mpolicy_manifest="https://raw.githubusercontent.com/k8snetworkplumbingwg/multi-networkpolicy/master/scheme.yml"
+  run_kubectl apply -f "$mpolicy_manifest"
+
+  echo "Installing ClusterUserDefinedNetwork CRD..."
+  mpolicy_manifest="https://raw.githubusercontent.com/k8snetworkplumbingwg/multi-networkpolicy/master/scheme.yml"
+  run_kubectl apply -f "$mpolicy_manifest"
+}
+
 kind_get_nodes() {
   kind get nodes --name "${KIND_CLUSTER_NAME}" | grep -v external-load-balancer
 }
