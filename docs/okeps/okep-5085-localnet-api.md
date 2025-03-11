@@ -15,6 +15,8 @@ configure the right VLANs that fit the provider network.
 
 - Enable creating user-defined-networks over localnet topology using OVN-K CUDN CRD.
 - Streamline localnet UX: detect misconfigurations early, communicate issues via informative status conditions and or events.
+- Allow localnet topology spec changes on day2, on top the CUDN CRD.
+- Indicate whether workloads require restart following localnet topology spec change on day2.
 
 ## Non-Goals
 
@@ -41,12 +43,24 @@ Workloads - pod or [KubeVirt](https://kubevirt.io/) VMs.
 - As a user I want to be able to connect my workloads (pod/VMs) to the localnet the admin created in my namespace.
 - As a user I want my workloads to be able to communicate with each other over the localnet network.
 - As a user I want my connected VMs to the localnet network to be able to migrate from one node to another, having its localnet network interface IP address unchanged.
+- As an admin I want to be able to perform day2 changes to the localnet topology spec following env changes.
+  - Change VLAN, e.g: following the being used has been decommissioned.
+  - Changing MTU, e.g: following HW has been changed requiring MTU re-alignment.
+  - Change the localnet topology bridge-mapping, e.g.: following a requirement to connect to different interfaces on the node.
+  - When I use OVN-K IP assignment, I am able to add/remove excluded IP addresses from the subnet the platform uses, 
+    because the external network introduced a new service requiring an additional reserved IP address.
+- As an admin I want to have indication whether the connected workloads require restart after I change the loclanet topology spec.
 
 ## Proposed Solution
 
+### Summary
 Extend the CUDN CRD to enable creating user-defined networks over localnet topology.
 Since the CUDN CRD is targeted for cluster-admin users, it enables preventing non-admin users performing changes that
 could disrupt the cluster or impact the physical network to which the workloads would connect to.
+
+Allow spec mutability for the CUDN localnet topology spec.
+
+Add status condition to indicate whether connected workloads require restart, following localnet topology spec change.
 
 #### Localnet using `NetworkAttachmentDefinition`
 As of today OVN-K enables multi-homing including localnet topology networks using NADs
@@ -129,6 +143,39 @@ The MTU value may be set by the user, and if not set then OVN-Kubernetes will de
 
 For localnet topology, the controller should specify MTU 1500 explicitly in the NAD, if no MTU was specified in the CUDN spec.
 
+#### Indicate connected workloads require restart following spec change
+The CUDN CRD should provide indication for users whether connected workloads are out of sync following localnet topology spec change,
+requiring a restart to be configured with the latest spec.
+Having indication in the CR status enable users figure out an action should be taken w/o additional troubleshooting. 
+
+Proposed solution: introduce new status condition type - `WorkloadsDegraded`:
+- Should be `true` when spec has been mutated, and there is at least one connected pod that is out of sync.
+- Should be `false` when all connected pods are in sync.
+
+Proposed strategy for determine whether a pod is in sync or not:
+Compare between the CR actual version and the version of the CR the pod was configured with (when it was created).
+In case the versions mismatch, the pod considered out of sync and require a restart in order to be re-configured with the latest CR spec.
+
+In order to determine whether a pod is configured with the latest CR spec, a pods should be annotated with the version of the CRs it was configured with.
+For example:
+Given pod is connected to CUDN CR with metadata.name is `blue`, and a UDN CR in namespace `tenant1` and metadata.name is `red`.
+```yaml
+k8s.ovn.org/udn-network-resource-version: [{"tenant1/blue": 10000, "tenant1/red": 20000 }]
+```
+Another option is to extend the `k8s.ovn.org/pod-networks` annotation to specify the NAD resource-version.
+
+> **Note**: Pod considered connected to network when the `k8s.ovn.org/pod-networks` annotation present, 
+> having the network NAD namespaced-name present. For example:
+> Given CUDN CR `metadata.name` is `blue`, selecting namespace `tenant1`.<br>
+> The NAD namespaced name will be `tenant1/blue`.<br>
+> A connected pod should have the following annotation:
+>```yaml
+>k8s.ovn.org/pod-networks: '{
+>...
+>"tenant1/cluster_cudn_blue":{"role":"secondary", ...}
+>}'
+>````
+
 #### Workflow Description
 
 The CUDN CRD controller should be changed accordingly to support localnet topology.
@@ -147,6 +194,19 @@ Enable changing at least the following fields: `MTU`, `VLAN`, `excludeSubnets` a
 In any order:
 - The user configures localnet bridge mapping on the nodes, e.g.: using NNCP.
 - Create CUDN, specifying the bridge-mapping network name in the spec.
+
+
+The CUDN CRD controller should support the `WorkloadsDegraded` status condition and manage its lifecycle.
+On a CUDN CR event, where spec has been changed and require updating the corresponding NAD spec, the controller should set the condition status to `true`.
+As now connected workloads should be restated in order to be configured with the latest spec.
+
+The condition status should be `false` when:
+1. No pod is connected.
+2. Connected pods are in sync; i.e: configured by a CR version, matching the current CR version.
+
+To achieve that, a controller should monitor pods and act on create/delete events:
+1. On pod create event, if all connected pods are in sync, set the condition to `false`.
+2. On pod delete event, if the pod is the only connected pod, set the condition to `false`.
 
 #### Generating the NAD
 ##### OVS bridge-mapping’s network-name
@@ -367,6 +427,27 @@ spec:
     }'
 ```
 
+Example 3 - `WorkloadsDegraded` condition is true:
+```yaml
+...
+status:
+  conditions: 
+  - type: WorkloadsDegraded
+    status: True
+    reason: WorkloadsRequireRestart
+    message: workload require restart in order to be configured with the latest spec.
+```
+Example 4 - `WorkloadsDegraded` condition is false:
+```yaml
+...
+status:
+  conditions: 
+  - type: WorkloadsDegraded
+    status: False
+    reason: WorkloadsReady
+    message: workloads can connect to the network
+```
+
 ### Implementation Details
 
 The CUDN `spec.network.topology` field should be extended to accept `Localnet` string.
@@ -539,11 +620,15 @@ type LocalnetConfig struct {
 2. Enable localnet CUDN CRs spec mutation 
    - Invert the CRD validations in a way spec mutation is allowed for localnet topology configuration only.
    - Add support for localnet topology configuration mutations in the CUDN CRD controller.
-3. Introduce CEL validation rule to ensure `excludedSubnets` items are in range of specified items in `subnets`.
+3. Change OVN-K to annotate pods with the proposed pod annotation
+   - The annotation should consist of the CRs versions the pod was configured with.
+4. Add for the purposed status condition.
+   - Change the CRDs controller to add the proposed condition, utilizing the proposed pod annotation for managing the condition lifecycle.
+5. Introduce CEL validation rule to ensure `excludedSubnets` items are in range of specified items in `subnets`.
    - Can be done once is resolved https://github.com/kubernetes/kubernetes/issues/130441.
    - Update the Kubernetes version using in CI that includes the bugfix.
    - Add the subject validation.
-4. E2e test verifying Kubevirt VMs can communicate over locanet topology network created using CUDN CR.
+6. E2e test verifying Kubevirt VMs can communicate over locanet topology network created using CUDN CR.
 
 
 ### Testing Details
