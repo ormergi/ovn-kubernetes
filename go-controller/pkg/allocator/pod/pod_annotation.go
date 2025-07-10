@@ -15,6 +15,7 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/id"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/ip"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/ip/subnet"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/mac"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/generator/udn"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kube"
@@ -30,6 +31,7 @@ type PodAnnotationAllocator struct {
 
 	netInfo              util.NetInfo
 	ipamClaimsReconciler persistentips.PersistentAllocations
+	macManager           *mac.ReservationManager
 }
 
 func NewPodAnnotationAllocator(
@@ -43,6 +45,7 @@ func NewPodAnnotationAllocator(
 		kube:                 kube,
 		netInfo:              netInfo,
 		ipamClaimsReconciler: claimsReconciler,
+		macManager:           mac.NewManager(),
 	}
 }
 
@@ -75,6 +78,7 @@ func (allocator *PodAnnotationAllocator) AllocatePodAnnotation(
 		pod,
 		network,
 		allocator.ipamClaimsReconciler,
+		allocator.macManager,
 		reallocateIP,
 		networkRole,
 	)
@@ -89,6 +93,7 @@ func allocatePodAnnotation(
 	pod *corev1.Pod,
 	network *nadapi.NetworkSelectionElement,
 	claimsReconciler persistentips.PersistentAllocations,
+	macManager *mac.ReservationManager,
 	reallocateIP bool,
 	networkRole string) (
 	updatedPod *corev1.Pod,
@@ -108,6 +113,7 @@ func allocatePodAnnotation(
 			pod,
 			network,
 			claimsReconciler,
+			macManager,
 			reallocateIP,
 			networkRole,
 		)
@@ -159,6 +165,7 @@ func (allocator *PodAnnotationAllocator) AllocatePodAnnotationWithTunnelID(
 		pod,
 		network,
 		allocator.ipamClaimsReconciler,
+		allocator.macManager,
 		reallocateIP,
 		networkRole,
 	)
@@ -174,6 +181,7 @@ func allocatePodAnnotationWithTunnelID(
 	pod *corev1.Pod,
 	network *nadapi.NetworkSelectionElement,
 	claimsReconciler persistentips.PersistentAllocations,
+	macManager *mac.ReservationManager,
 	reallocateIP bool,
 	networkRole string) (
 	updatedPod *corev1.Pod,
@@ -190,6 +198,7 @@ func allocatePodAnnotationWithTunnelID(
 			pod,
 			network,
 			claimsReconciler,
+			macManager,
 			reallocateIP,
 			networkRole,
 		)
@@ -264,6 +273,7 @@ func allocatePodAnnotationWithRollback(
 	pod *corev1.Pod,
 	network *nadapi.NetworkSelectionElement,
 	claimsReconciler persistentips.PersistentAllocations,
+	macManager *mac.ReservationManager,
 	reallocateIP bool,
 	networkRole string) (
 	updatedPod *corev1.Pod,
@@ -283,12 +293,26 @@ func allocatePodAnnotationWithRollback(
 	// for defer to work correctly.
 	var releaseIPs []*net.IPNet
 	var releaseID int
+	var releaseMAC net.HardwareAddr
+	networkName := netInfo.GetNetworkName()
+	ownerID := GetMACOwner(pod, netInfo)
 	rollback = func() {
 		if releaseID != 0 {
 			idAllocator.ReleaseID()
 			klog.V(5).Infof("Released ID %d", releaseID)
 			releaseID = 0
 		}
+
+		if releaseMAC != nil &&
+			config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
+			netInfo.IsPrimaryNetwork() &&
+			netInfo.TopologyType() == types.Layer2Topology {
+			if rerr := macManager.Release(networkName, ownerID, releaseMAC); rerr != nil {
+				klog.V(5).Infof("Failed to release reserved MAC address (%s): %v", releaseMAC.String(), rerr)
+			}
+			releaseMAC = nil
+		}
+
 		if len(releaseIPs) == 0 {
 			return
 		}
@@ -298,7 +322,6 @@ func allocatePodAnnotationWithRollback(
 			releaseIPs = nil
 			return
 		}
-		klog.V(5).Infof("Released IPs %v", util.StringSlice(releaseIPs))
 		releaseIPs = nil
 	}
 	defer func() {
@@ -434,6 +457,18 @@ func allocatePodAnnotationWithRollback(
 		}
 		if err != nil {
 			return
+		}
+		if config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
+			netInfo.IsPrimaryNetwork() &&
+			netInfo.TopologyType() == types.Layer2Topology {
+			if rerr := macManager.Reserve(networkName, ownerID, tentative.MAC); rerr != nil {
+				// avoid leaking the network name because this error may reflect of a pod event, which is visible to non-admins.
+				err = fmt.Errorf("failed to reserve MAC address (%s) for owner (%s) on network attachment (%s): %w",
+					tentative.MAC, ownerID, nadName, rerr)
+				klog.Errorf("%v, network-name: (%s)", err, networkName)
+				return
+			}
+			releaseMAC = tentative.MAC
 		}
 
 		// handle routes & gateways
