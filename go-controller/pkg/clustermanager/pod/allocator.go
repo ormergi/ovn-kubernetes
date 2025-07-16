@@ -316,6 +316,17 @@ func (a *PodAllocator) releasePodOnNAD(pod *corev1.Pod, nad string, network *net
 		klog.V(5).Infof("Released IPs %v", util.StringSlice(podAnnotation.IPs))
 	}
 
+	if doRelease {
+		if config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
+			a.netInfo.IsPrimaryNetwork() &&
+			a.netInfo.TopologyType() == types.Layer2Topology {
+			if err := a.podAnnotationAllocator.ReleasePodReservedMacAddress(pod, nad); err != nil {
+				// do not return error to allow the caller handle this state
+				klog.Error(err)
+			}
+		}
+	}
+
 	if podDeleted {
 		a.deleteReleasedPod(nad, string(pod.UID))
 	} else {
