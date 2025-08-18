@@ -246,6 +246,14 @@ func (ncc *networkClusterController) init() error {
 			ipamClaimsReconciler,
 		)
 
+		if config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
+			ncc.IsPrimaryNetwork() &&
+			ncc.TopologyType() == types.Layer2Topology {
+			if err := podAllocationAnnotator.InitializeMACManager(); err != nil {
+				return fmt.Errorf("failed to intialize MAC addresses manager: %w", err)
+			}
+		}
+
 		ncc.podAllocator = pod.NewPodAllocator(
 			ncc.GetNetInfo(),
 			podAllocationAnnotator,
