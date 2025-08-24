@@ -2370,7 +2370,7 @@ chpasswd: { expire: False }
 			return vm
 		}
 
-		It("should fail when creating second VM with duplicate static IP", func() {
+		FIt("should fail when creating second VM with duplicate static IP", func() {
 			if !isPreConfiguredUdnAddressesEnabled() {
 				Skip("ENABLE_PRE_CONF_UDN_ADDR not configured")
 			}
@@ -2404,6 +2404,22 @@ chpasswd: { expire: False }
 				HaveField("Type", kubevirtv1.VirtualMachineInstanceAgentConnected),
 				HaveField("Status", corev1.ConditionTrue),
 			)))
+			Expect(crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi1), vmi1)).To(Succeed())
+			Expect(vmi1.Status.Interfaces[0].MAC).To(Equal(testMAC), "vmi status should report the specified mac")
+
+			By("Restarting VM")
+			output, err := virtClient.RestartVirtualMachine(vmi1)
+			Expect(err).NotTo(HaveOccurred(), output)
+			// wait for VM  time to vmi conditions to catch up after restart
+			time.Sleep(3 * time.Second)
+			waitVirtualMachineInstanceReadiness(vmi1)
+			By("Assert VM static MAC remain aster restart")
+			Expect(crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi1), vmi1)).To(Succeed())
+			Expect(vmi1.Status.Interfaces[0].MAC).To(Equal(testMAC), "vmi status should report the specified mac")
+
+			By("Migrating VM")
+			liveMigrateSucceed(vmi1)
+			By("Assert VM static MAC remain after migration")
 			Expect(crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi1), vmi1)).To(Succeed())
 			Expect(vmi1.Status.Interfaces[0].MAC).To(Equal(testMAC), "vmi status should report the specified mac")
 

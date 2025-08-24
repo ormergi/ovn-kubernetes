@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 
+	ipamclaimsapi "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1"
+
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -222,11 +224,23 @@ func (a *PodAllocator) reconcile(old, new *corev1.Pod, releaseFromAllocator bool
 
 	// reconcile for each NAD
 	for nadName, network := range networkMap {
+		klog.Infof("DEBUG: reconcile: nadName: %s", nadName)
 		err = a.reconcileForNAD(old, new, nadName, network, releaseFromAllocator)
 		if err != nil {
 			return err
 		}
 	}
+
+	// var errs []error
+	// for nadName, network := range networkMap {
+	// 	klog.Infof("DEBUG: reconcile: nadName: %s", nadName)
+	// 	err = a.reconcileForNAD(old, new, nadName, network, releaseFromAllocator)
+	// 	if err != nil {
+	// 		errs = append(errs, fmt.Errorf("failed to reconcile nad %s :%w", nadName, err))
+	// 	}
+	// }
+
+	// return errors.Join(errs...)
 
 	return nil
 }
@@ -274,8 +288,10 @@ func (a *PodAllocator) releasePodOnNAD(pod *corev1.Pod, nad string, network *net
 		)
 		hasIPAMClaim = false
 	}
+	var ipamClaim *ipamclaimsapi.IPAMClaim
 	if hasIPAMClaim {
-		ipamClaim, err := a.ipamClaimsReconciler.FindIPAMClaim(network.IPAMClaimReference, network.Namespace)
+		var err error
+		ipamClaim, err = a.ipamClaimsReconciler.FindIPAMClaim(network.IPAMClaimReference, network.Namespace)
 		hasIPAMClaim = ipamClaim != nil && len(ipamClaim.Status.IPs) > 0
 		if apierrors.IsNotFound(err) {
 			klog.Errorf("Failed to retrieve IPAMClaim %q but will release IPs: %v", network.IPAMClaimReference, err)
@@ -283,6 +299,7 @@ func (a *PodAllocator) releasePodOnNAD(pod *corev1.Pod, nad string, network *net
 			return fmt.Errorf("failed to get IPAMClaim %s/%s: %w", network.Namespace, network.IPAMClaimReference, err)
 		}
 	}
+	klog.Infof("DEBUG: releasePodOnNAD: ipamClaim exists? :%v" ,ipamClaim != nil)
 
 	if !hasIPAM && !hasIDAllocation {
 		// we only take care of IP and tunnel ID allocation, if neither were
@@ -316,14 +333,17 @@ func (a *PodAllocator) releasePodOnNAD(pod *corev1.Pod, nad string, network *net
 		klog.V(5).Infof("Released IPs %v", util.StringSlice(podAnnotation.IPs))
 	}
 
-	if doRelease {
-		if config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
-			a.netInfo.IsPrimaryNetwork() &&
-			a.netInfo.TopologyType() == types.Layer2Topology {
-			if err := a.podAnnotationAllocator.ReleasePodReservedMacAddress(pod, nad); err != nil {
-				// do not return error to allow the caller handle this state
-				klog.Error(err)
-			}
+	klog.Infof("DEBUG: BEFORE releasePodOnNAD: nad: %s", nad)
+	klog.Infof("DEBUG: BEFORE releasePodOnNAD: podAnnotation: %+v", podAnnotation)
+	if doRelease &&
+		config.OVNKubernetesFeature.EnablePreconfiguredUDNAddresses &&
+		a.netInfo.IsPrimaryNetwork() &&
+		a.netInfo.TopologyType() == types.Layer2Topology {
+		klog.Infof("DEBUG: releasePodOnNAD: nad: %s", nad)
+		klog.Infof("DEBUG: releasePodOnNAD: podAnnotation: %v", podAnnotation)
+
+		if err := a.podAnnotationAllocator.ReleasePodReservedMacAddress(pod, podAnnotation.MAC, ipamClaim); err != nil {
+			return err 
 		}
 	}
 

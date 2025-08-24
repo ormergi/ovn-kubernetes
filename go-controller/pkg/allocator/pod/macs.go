@@ -2,9 +2,10 @@ package pod
 
 import (
 	"fmt"
-	"maps"
 	"net"
 
+	ipamclaimsapi "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1"
+	
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,9 +20,9 @@ import (
 
 // GetMACOwner compose the owner identifier reserved for MAC addresses management.
 // Returns "<ns>/<pod-name>" for regular pods and "<ns>/<vm-name>" for VMs with persistent IPs enabled.
-func GetMACOwner(pod *corev1.Pod, netInfo util.NetInfo) string {
+func GetMACOwner(pod *corev1.Pod) string {
 	// Check if this is a VM pod and persistent IPs are enabled
-	if vmName, ok := pod.Labels[kubevirtv1.VirtualMachineNameLabel]; ok && netInfo.AllowsPersistentIPs() {
+	if vmName, ok := pod.Labels[kubevirtv1.VirtualMachineNameLabel]; ok {
 		return fmt.Sprintf("%s/%s", pod.Namespace, vmName)
 	}
 
@@ -31,37 +32,36 @@ func GetMACOwner(pod *corev1.Pod, netInfo util.NetInfo) string {
 
 // ReleasePodReservedMacAddress releases pod's reserved MAC address, if exists.
 // It removes the used MAC address, from pod network annotation, and remove it from the MAC manager store.
-func (allocator *PodAnnotationAllocator) ReleasePodReservedMacAddress(pod *corev1.Pod, nadName string) error {
-	podNetworks, err := util.UnmarshalPodAnnotationAllNetworks(pod.Annotations)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal pod annotation: %w", err)
+func (allocator *PodAnnotationAllocator) ReleasePodReservedMacAddress(pod *corev1.Pod, mac net.HardwareAddr, claim *ipamclaimsapi.IPAMClaim) error {
+	klog.Infof("DEBUG: ReleasePodReservedMacAddress: pod: %s/%s ", pod.Namespace, pod.Name)
+	klog.Infof("DEBUG: ReleasePodReservedMacAddress: mac: %s", mac)
+	klog.Infof("DEBUG: ReleasePodReservedMacAddress: pod.Annot: %s", pod.Annotations[util.OvnPodAnnotationName])
+	klog.Infof("DEBUG: ReleasePodReservedMacAddress: pod: %+v", claim)
+	if mac == nil {
+		return nil
 	}
-	for nad, podNetwork := range podNetworks {
-		if nad != nadName || podNetwork.MAC == "" {
-			continue
-		}
-		mac, perr := net.ParseMAC(podNetwork.MAC)
-		if perr != nil {
-			return fmt.Errorf("failed to parse MAC address from pod annotation: %v", perr)
-		}
-		networkName := allocator.netInfo.GetNetworkName()
-		owner := GetMACOwner(pod, allocator.netInfo)
-		if aerr := allocator.macManager.Release(networkName, owner, mac); aerr != nil {
-			// avoid exposing network name in error because they may reflect on pod event
-			return fmt.Errorf("failed to release MAC address (%s) for owner (%s) on network attachment (%s): %w",
-				podNetwork.MAC, owner, nad, aerr)
-		}
+	if _, exist := pod.Labels[kubevirtv1.VirtualMachineNameLabel]; exist && claim != nil {
+		klog.V(5).Infof("Retaining MAC address %s because the pod's (%s/%s) referenced IPAM claim present (%s/%s)", 
+		 	mac, pod.Namespace, pod.Name, claim.Namespace, claim.Name)
+		return nil
+	}
 
-		klog.V(5).Infof("Released MAC: (%s), pod: (%s/%s), network: (%s), nad: (%s)",
-			podNetwork.MAC, pod.Namespace, pod.Name, networkName, nad)
+	networkName := allocator.netInfo.GetNetworkName()
+	owner := GetMACOwner(pod)
+	if aerr := allocator.macManager.Release(networkName, owner, mac); aerr != nil {
+		// avoid exposing network name in error because they may reflect on pod event
+		return fmt.Errorf("failed to release MAC address (%s) for owner (%s): %w",
+		 mac.String(), owner, aerr)
 	}
+
+	klog.V(5).Infof("Released MAC following pod deletion: (%s), owner: (%s), network: (%s)", mac.String(), owner, networkName)
 
 	return nil
 }
 
 // InitializeMACManager initializes MAC reservation tracker with MAC addresses in use in the network.
 func (allocator *PodAnnotationAllocator) InitializeMACManager() error {
-	macs := calculateSubnetsInfraMACAddresses(allocator.netInfo.Subnets())
+	infraMACs := calculateSubnetsInfraMACAddresses(allocator.netInfo.Subnets())
 
 	pods, err := allocator.fetchNetworkPods()
 	if err != nil {
@@ -71,12 +71,18 @@ func (allocator *PodAnnotationAllocator) InitializeMACManager() error {
 	if err != nil {
 		return err
 	}
-	maps.Copy(macs, podMACs)
 
 	networkName := allocator.netInfo.GetNetworkName()
-	for owner, mac := range macs {
+	// reserve MCAs used by infra first, to prevent network disruptions to connected pods in case of conflict.
+	for owner, mac := range infraMACs {
 		if rerr := allocator.macManager.Reserve(networkName, owner, mac); rerr != nil {
-			return fmt.Errorf("failed to reserve MAC (%s) for owner (%s) on network (%s): %w",
+			return fmt.Errorf("failed to reserve infra MAC (%s) for owner (%s) on network (%s): %w",
+				mac, owner, networkName, rerr)
+		}
+	}
+	for owner, mac := range podMACs {
+		if rerr := allocator.macManager.Reserve(networkName, owner, mac); rerr != nil {
+			return fmt.Errorf("failed to reserve pod MAC (%s) for owner (%s) on network (%s): %w",
 				mac, owner, networkName, rerr)
 		}
 	}
@@ -146,7 +152,7 @@ func (allocator *PodAnnotationAllocator) getPodMACs(pods []*corev1.Pod) (map[str
 			if perr != nil {
 				return nil, fmt.Errorf("failed to parse mac address %s/%s: %v", pod.Namespace, pod.Name, perr)
 			}
-			podMACs[GetMACOwner(pod, allocator.netInfo)] = mac
+			podMACs[GetMACOwner(pod)] = mac
 		}
 	}
 

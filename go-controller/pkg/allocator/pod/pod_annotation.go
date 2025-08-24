@@ -295,7 +295,7 @@ func allocatePodAnnotationWithRollback(
 	var releaseID int
 	var releaseMAC net.HardwareAddr
 	networkName := netInfo.GetNetworkName()
-	ownerID := GetMACOwner(pod, netInfo)
+	ownerID := GetMACOwner(pod)
 	rollback = func() {
 		if releaseID != 0 {
 			idAllocator.ReleaseID()
@@ -331,6 +331,7 @@ func allocatePodAnnotationWithRollback(
 	}()
 
 	podAnnotation, _ = util.UnmarshalPodAnnotation(pod.Annotations, nadName)
+	//isNetworkAllocated := podAnnotation != nil
 	if podAnnotation == nil {
 		podAnnotation = &util.PodAnnotation{}
 	}
@@ -468,7 +469,7 @@ func allocatePodAnnotationWithRollback(
 				klog.Errorf("%v, network-name: (%s)", err, networkName)
 				return
 			}
-			releaseMAC = tentative.MAC
+			//releaseMAC = tentative.MAC
 		}
 
 		// handle routes & gateways

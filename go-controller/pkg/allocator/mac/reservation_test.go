@@ -47,7 +47,7 @@ var _ = Describe("ReservationManager", func() {
 			Expect(tracker.Reserve(testNetwork, owner1, mac1)).To(Succeed())
 			Expect(tracker.Reserve(testNetwork, owner1, mac1)).To(Succeed(), "same owner should not raise a conflict")
 			err := tracker.Reserve(testNetwork, owner2, mac1)
-			Expect(err).NotTo(HaveOccurred(), "diffrent owner should not raise a conflict")
+			Expect(err).To(HaveOccurred(), "different owner should raise a conflict")
 			Expect(errors.Is(err, mac.ErrMACConflict)).To(BeTrue())
 		})
 		It("should isolate MACs between different networks", func() {

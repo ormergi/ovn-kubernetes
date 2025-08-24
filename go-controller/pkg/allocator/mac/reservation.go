@@ -48,11 +48,15 @@ func (n *ReservationManager) Reserve(network, owner string, mac net.HardwareAddr
 	}
 
 	macKey := mac.String()
-	if currentOwner, macReserved := macStore[macKey]; macReserved && currentOwner != owner {
+	currentOwner, macReserved := macStore[macKey]
+	if macReserved && currentOwner != owner {
 		return ErrMACConflict
 	}
 
-	n.networkReservations[network][macKey] = owner
+	if macReserved {
+		return nil
+	}
+	macStore[macKey] = owner
 	klog.V(5).Infof("Reserved MAC (%s) for owner (%s) on network (%s)", macKey, owner, network)
 
 	return nil
@@ -73,7 +77,8 @@ func (n *ReservationManager) Release(network string, owner string, mac net.Hardw
 	}
 
 	macKey := mac.String()
-	if currentOwner, exists := macStore[macKey]; exists && currentOwner != owner {
+	currentOwner, macReserved := macStore[macKey]
+	if !macReserved || currentOwner != owner {
 		return nil
 	}
 
