@@ -537,6 +537,10 @@ set_default_params() {
   if [ ${KIND_CLUSTER_NAME} != "ovn" ]; then
     MANIFEST_OUTPUT_DIR="${DIR}/../dist/yaml/${KIND_CLUSTER_NAME}"
   fi
+  KIND_NETWORK=${KIND_NETWORK:-kind}
+  if [[ -n ${KIND_EXPERIMENTAL_PODMAN_NETWORK} ]]; then
+    KIND_NETWORK=${KIND_EXPERIMENTAL_PODMAN_NETWORK}
+  fi
   RUN_IN_CONTAINER=${RUN_IN_CONTAINER:-false}
   OVN_GATEWAY_MODE=${OVN_GATEWAY_MODE:-shared}
   KIND_INSTALL_INGRESS=${KIND_INSTALL_INGRESS:-false}
@@ -748,8 +752,8 @@ create_local_registry() {
 
 connect_local_registry() {
     # connect the registry to the cluster network if not already connected
-    if [ "$($OCI_BIN inspect -f='{{json .NetworkSettings.Networks.kind}}' "${KIND_LOCAL_REGISTRY_NAME}")" = 'null' ]; then
-      $OCI_BIN network connect "kind" "${KIND_LOCAL_REGISTRY_NAME}"
+    if [ "$($OCI_BIN inspect -f="{{json .NetworkSettings.Networks.${KIND_NETWORK}}" "${KIND_LOCAL_REGISTRY_NAME}")" = 'null' ]; then
+      $OCI_BIN network connect "${KIND_NETWORK}" "${KIND_LOCAL_REGISTRY_NAME}"
     fi
 
     # Reference docs for local registry:
@@ -1161,9 +1165,9 @@ add_dns_hostnames() {
   KIND_NODES=$(kind get nodes --name "${KIND_CLUSTER_NAME}")
   # find all IPs and build dns entries
   for n in $KIND_NODES; do
-	ip=$(docker container inspect -f '{{ .NetworkSettings.Networks.kind.IPAddress }}' $n)
+	ip=$(docker container inspect -f "{{ .NetworkSettings.Networks.${KIND_NETWORK}.IPAddress }}" $n)
         dns+="$ip $n \n"
-        ip=$(docker container inspect -f '{{ .NetworkSettings.Networks.kind.GlobalIPv6Address }}' $n)
+        ip=$(docker container inspect -f "{{ .NetworkSettings.Networks.${KIND_NETWORK}.GlobalIPv6Address }}" $n)
 	dns+="$ip $n \n"
   done
 
