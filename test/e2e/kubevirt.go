@@ -267,7 +267,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 						Port: port,
 					}},
 					Selector: map[string]string{
-						kubevirtv1.VirtualMachineNameLabel: vmName,
+						kubevirtv1.DeprecatedVirtualMachineNameLabel: vmName,
 					},
 					Type:           corev1.ServiceTypeNodePort,
 					IPFamilyPolicy: &ipFamilyPolicy,
@@ -289,7 +289,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 					},
 					Spec: knet.NetworkPolicySpec{
 						PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{
-							kubevirtv1.VirtualMachineNameLabel: vmName,
+							kubevirtv1.DeprecatedVirtualMachineNameLabel: vmName,
 						}},
 						PolicyTypes: []knet.PolicyType{knet.PolicyTypeEgress, knet.PolicyTypeIngress},
 						Ingress:     []knet.NetworkPolicyIngressRule{},
@@ -861,7 +861,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			GinkgoHelper()
 			Eventually(func() []corev1.Event {
 				podList, err := fr.ClientSet.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{
-					LabelSelector: fmt.Sprintf("%s=%s", kubevirtv1.VirtualMachineNameLabel, vmName),
+					LabelSelector: fmt.Sprintf("%s=%s", kubevirtv1.DeprecatedVirtualMachineNameLabel, vmName),
 				})
 				if err != nil || len(podList.Items) == 0 {
 					return nil
@@ -2583,7 +2583,7 @@ chpasswd: { expire: False }
 			createVirtualMachine(vm2)
 
 			By("Asserting second VM pod has attached event reflecting MAC conflict error")
-			vm2Selector := fmt.Sprintf("%s=%s", kubevirtv1.VirtualMachineNameLabel, vm2.Name)
+			vm2Selector := fmt.Sprintf("%s=%s", kubevirtv1.DeprecatedVirtualMachineNameLabel, vm2.Name)
 			Eventually(func(g Gomega) []corev1.Event {
 				podList, err := fr.ClientSet.CoreV1().Pods(vm2.Namespace).List(context.Background(), metav1.ListOptions{LabelSelector: vm2Selector})
 				g.Expect(err).ToNot(HaveOccurred())

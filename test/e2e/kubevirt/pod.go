@@ -22,7 +22,7 @@ func GenerateFakeVirtLauncherPod(namespace, vmName string) *corev1.Pod {
 			Name:      "virt-launcher-" + vmName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				kubevirtv1.VirtualMachineNameLabel: vmName,
+				kubevirtv1.DeprecatedVirtualMachineNameLabel: vmName,
 			},
 		},
 		Spec: corev1.PodSpec{
