@@ -99,11 +99,45 @@ func newControllerRuntimeClient() (crclient.Client, error) {
 	})
 }
 
-var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, func() {
+func newControllerRuntimeClientFromEnvVar(envVar string) (crclient.Client, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv(envVar))
+	if err != nil {
+		return nil, err
+	}
+	scheme := runtime.NewScheme()
+	if err := kubevirtv1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := kvmigrationsv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := ipamclaimsv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := nadv1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := udnv1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := rav1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	return crclient.New(config, crclient.Options{
+		Scheme: scheme,
+	})
+}
+
+var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, func() {
 	var (
 		fr                  = wrappedTestFramework("kv-live-migration")
 		d                   = diagnostics.New(fr)
 		crClient            crclient.Client
+		srcClient           crclient.Client
+		dstClient           crclient.Client
 		virtClient          *kubevirt.Client
 		namespace           string
 		iperf3DefaultPort   = int32(5201)
@@ -633,6 +667,125 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				return fmt.Sprintf("should live migrate successfully: %s", string(vmiJSON))
 			})
 			Expect(vmi.Status.MigrationState.Mode).To(Equal(migrationMode), "should be the expected migration mode %s", migrationMode)
+		}
+
+		ccLiveMigrateVirtualMachine = func(vmName string) {
+			// the test assume source and destination cluster has Kubeivrt certificate exchanged
+			// and a connected via migration network.
+
+			GinkgoHelper()
+			const migrationID = "cclm-test"
+
+			kv := &kubevirtv1.KubeVirt{}
+			dstClient.Get(context.Background(), crclient.ObjectKey{Namespace: "kubevirt", Name: "kubevirt"}, kv)
+			// TODO: take the IP accoring to env IP family
+			url := kv.Status.SynchronizationAddresses[0]
+
+			vmimCreationRetries := 0
+			// create destination vmim
+			Eventually(func() error {
+				if vmimCreationRetries > 0 {
+					// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+					// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+					By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+				}
+				vmim := &kubevirtv1.VirtualMachineInstanceMigration{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:    namespace,
+						GenerateName: vmName,
+					},
+					Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
+						VMIName: vmName,
+						Receive: &kubevirtv1.VirtualMachineInstanceMigrationTarget{
+							MigrationID: migrationID,
+						},
+					},
+				}
+				err := dstClient.Create(context.Background(), vmim)
+				vmimCreationRetries++
+				return err
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+			// create source vmim
+			Eventually(func() error {
+				if vmimCreationRetries > 0 {
+					// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+					// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+					By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+				}
+				vmim := &kubevirtv1.VirtualMachineInstanceMigration{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:    namespace,
+						GenerateName: vmName,
+					},
+					Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
+						VMIName: vmName,
+						SendTo: &kubevirtv1.VirtualMachineInstanceMigrationSource{
+							MigrationID: migrationID,
+							ConnectURL:  url,
+						},
+					},
+				}
+				err := srcClient.Create(context.Background(), vmim)
+				vmimCreationRetries++
+				return err
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+		}
+
+		checkCCLiveMigrationSucceeded = func(vmName string, migrationMode kubevirtv1.MigrationMode) {
+			GinkgoHelper()
+			By("checking the VM live-migrated correctly")
+			vmi := &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      vmName,
+				},
+			}
+			err := dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
+			Expect(err).NotTo(HaveOccurred(), "should success retrieving vmi")
+			currentNode := vmi.Status.NodeName
+
+			Eventually(func() *kubevirtv1.VirtualMachineInstanceMigrationState {
+				err := dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
+				Expect(err).NotTo(HaveOccurred())
+				return vmi.Status.MigrationState
+			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(BeNil(), "should have a MigrationState")
+			Eventually(func() string {
+				err := crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
+				Expect(err).NotTo(HaveOccurred())
+				return vmi.Status.MigrationState.TargetNode
+			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(Equal(currentNode), "should refresh MigrationState")
+			Eventually(func() bool {
+				err := crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
+				Expect(err).NotTo(HaveOccurred())
+				return vmi.Status.MigrationState.Completed
+			}).WithPolling(time.Second).WithTimeout(20*time.Minute).Should(BeTrue(), "should complete migration")
+			Expect(dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)).To(Succeed())
+			Expect(vmi.Status.MigrationState.SourcePod).NotTo(BeEmpty())
+			Eventually(func() corev1.PodPhase {
+				sourcePod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: namespace,
+						Name:      vmi.Status.MigrationState.SourcePod,
+					},
+				}
+				err = crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(sourcePod), sourcePod)
+				Expect(err).NotTo(HaveOccurred())
+				return sourcePod.Status.Phase
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Equal(corev1.PodSucceeded), "should move source pod to Completed")
+			err = dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
+			Expect(err).NotTo(HaveOccurred(), "should success retrieving vmi after migration")
+			Expect(vmi.Status.MigrationState.Failed).To(BeFalse(), func() string {
+				vmiJSON, err := json.Marshal(vmi)
+				if err != nil {
+					return fmt.Sprintf("failed marshaling migrated VM: %v", vmiJSON)
+				}
+				return fmt.Sprintf("should live migrate successfully: %s", string(vmiJSON))
+			})
+			Expect(vmi.Status.MigrationState.Mode).To(Equal(migrationMode), "should be the expected migration mode %s", migrationMode)
+		}
+		ccliveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
+			ccLiveMigrateVirtualMachine(vmi.Name)
+			checkCCLiveMigrationSucceeded(vmi.Name, kubevirtv1.MigrationPreCopy)
 		}
 
 		liveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
@@ -1349,6 +1502,12 @@ fi
 
 		var err error
 		crClient, err = newControllerRuntimeClient()
+		Expect(err).NotTo(HaveOccurred())
+
+		srcClient, err = newControllerRuntimeClientFromEnvVar("SRC_CLUSTER_CONF")
+		Expect(err).NotTo(HaveOccurred())
+
+		srcClient, err = newControllerRuntimeClientFromEnvVar("DST_CLUSTER_CONF")
 		Expect(err).NotTo(HaveOccurred())
 
 		virtClient, err = kubevirt.NewClient("/tmp")
@@ -2211,7 +2370,7 @@ ip route add %[3]s via %[4]s
 
 		})
 	})
-	Context("with user defined networks with ipamless localnet topology", Ordered, func() {
+	FContext("with user defined networks with ipamless localnet topology", Ordered, func() {
 		BeforeEach(func() {
 			ns, err := fr.CreateNamespace(context.TODO(), fr.BaseName, map[string]string{
 				"e2e-framework": fr.BaseName,
@@ -2348,6 +2507,7 @@ chpasswd: { expire: False }
 		},
 			Entry("after succeeded live migration", liveMigrateSucceed),
 			Entry("after failed live migration", liveMigrateFailed),
+			FEntry("after succeeded cross-cluster live migration", ccliveMigrateSucceed),
 		)
 	})
 
