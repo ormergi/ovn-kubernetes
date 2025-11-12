@@ -171,7 +171,7 @@ require (
 	k8s.io/kube-scheduler v0.33.3 // indirect
 	k8s.io/kubelet v0.33.3 // indirect
 	k8s.io/mount-utils v0.33.3 // indirect
-	kubevirt.io/containerized-data-importer-api v1.57.0-alpha1 // indirect
+	kubevirt.io/containerized-data-importer-api v1.60.3-0.20241105012228-50fbed985de9 // indirect
 	kubevirt.io/controller-lifecycle-operator-sdk/api v0.0.0-20220329064328-f3cc58c6ed90 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.33.0 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
@@ -194,7 +194,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubectl v0.33.3
-	kubevirt.io/api v1.4.0
+	kubevirt.io/api v1.6.2
 	sigs.k8s.io/controller-runtime v0.21.0
 )
 
