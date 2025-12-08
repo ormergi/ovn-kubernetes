@@ -20,6 +20,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	utilnet "k8s.io/utils/net"
 )
@@ -34,7 +35,7 @@ func IsProvider() bool {
 	if err != nil {
 		panic(fmt.Sprintf("unable to get current cluster context: %v", err))
 	}
-	if strings.Contains(string(currentCtx), "kind-ovn") {
+	if strings.Contains(string(currentCtx), "ovn") {
 		return true
 	}
 	return false
@@ -365,7 +366,7 @@ func (c *contextKind) getAttachedNetworks() (api.Networks, error) {
 	return attachedNetworks, nil
 }
 
-func (c *contextKind) SetupUnderlay(f *framework.Framework, underlay api.Underlay) error {
+func (c *contextKind) SetupUnderlay(ctl kubernetes.Interface, underlay api.Underlay) error {
 	if underlay.LogicalNetworkName == "" {
 		return fmt.Errorf("underlay logical network name must be set")
 	}
@@ -382,7 +383,7 @@ func (c *contextKind) SetupUnderlay(f *framework.Framework, underlay api.Underla
 		ovsKubeNodeLabel = "app=ovnkube-node"
 	)
 
-	ovsPodList, err := f.ClientSet.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).List(
+	ovsPodList, err := ctl.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).List(
 		context.Background(),
 		metav1.ListOptions{LabelSelector: ovsKubeNodeLabel},
 	)

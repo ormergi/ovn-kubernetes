@@ -53,7 +53,7 @@ var _ = Describe("Network Segmentation: Localnet", feature.NetworkSegmentation, 
 
 		By("setup the localnet underlay")
 		c := networkAttachmentConfig{networkAttachmentConfigParams: networkAttachmentConfigParams{networkName: physicalNetworkName, vlanID: vlan}}
-		Expect(providerCtx.SetupUnderlay(f, infraapi.Underlay{
+		Expect(providerCtx.SetupUnderlay(f.ClientSet, infraapi.Underlay{
 			BridgeName:         ovsBrName,
 			LogicalNetworkName: c.networkName,
 			VlanID:             c.vlanID,

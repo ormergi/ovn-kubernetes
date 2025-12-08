@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -676,20 +677,38 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			GinkgoHelper()
 			const migrationID = "cclm-test"
 
-			kv := &kubevirtv1.KubeVirt{}
-			dstClient.Get(context.Background(), crclient.ObjectKey{Namespace: "kubevirt", Name: "kubevirt"}, kv)
-			// TODO: take the IP accoring to env IP family
-			url := kv.Status.SynchronizationAddresses[0]
-
-			vmimCreationRetries := 0
-			// create destination vmim
+			By("creating destionation VM from source VM spec")
+			srcVM := &kubevirtv1.VirtualMachine{}
+			Expect(crClient.Get(context.Background(), crclient.ObjectKey{Namespace: namespace, Name: vmName}, srcVM)).To(Succeed())
+			spec := srcVM.Spec.DeepCopy()
+			spec.RunStrategy = ptr.To(kubevirtv1.RunStrategyWaitAsReceiver)
+			dstVM := &kubevirtv1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: srcVM.Name,
+					Namespace: namespace,
+				},
+				Spec: *spec,
+			}
+			dstVMCreationRetries := 0
 			Eventually(func() error {
-				if vmimCreationRetries > 0 {
+				if dstVMCreationRetries > 0 {
 					// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
 					// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
 					By(fmt.Sprintf("Retrying vmim %s creation", vmName))
 				}
-				vmim := &kubevirtv1.VirtualMachineInstanceMigration{
+				err := dstClient.Create(context.Background(), dstVM)
+				dstVMCreationRetries++
+				return err
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+
+			By("fetch destination cluster kubevirt instnace migration url")
+			kv := &kubevirtv1.KubeVirt{}
+			Expect(dstClient.Get(context.Background(), crclient.ObjectKey{Namespace: "kubevirt", Name: "kubevirt"}, kv)).To(Succeed())
+			// TODO: take the IP accoring to env IP family
+			migrationURL := kv.Status.SynchronizationAddresses[0]
+			
+			By("creating VMIM on destionation cluster")
+			dstVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:    namespace,
 						GenerateName: vmName,
@@ -700,19 +719,21 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 							MigrationID: migrationID,
 						},
 					},
-				}
-				err := dstClient.Create(context.Background(), vmim)
-				vmimCreationRetries++
-				return err
-			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
-			// create source vmim
+			}
+			dstVMIMCreationRetries := 0
 			Eventually(func() error {
-				if vmimCreationRetries > 0 {
+				if dstVMIMCreationRetries > 0 {
 					// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
 					// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
 					By(fmt.Sprintf("Retrying vmim %s creation", vmName))
 				}
-				vmim := &kubevirtv1.VirtualMachineInstanceMigration{
+				err := dstClient.Create(context.Background(), dstVMIM)
+				dstVMIMCreationRetries++
+				return err
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+			
+			By("creating VMIM on source cluster")
+			srcVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:    namespace,
 						GenerateName: vmName,
@@ -721,12 +742,19 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 						VMIName: vmName,
 						SendTo: &kubevirtv1.VirtualMachineInstanceMigrationSource{
 							MigrationID: migrationID,
-							ConnectURL:  url,
+							ConnectURL:  migrationURL,
 						},
 					},
 				}
-				err := srcClient.Create(context.Background(), vmim)
-				vmimCreationRetries++
+			srcVMIMICreationRetries := 0
+			Eventually(func() error {
+				if srcVMIMICreationRetries > 0 {
+					// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+					// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+					By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+				}
+				err := srcClient.Create(context.Background(), srcVMIM)
+				srcVMIMICreationRetries++
 				return err
 			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
 		}
@@ -734,56 +762,52 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 		checkCCLiveMigrationSucceeded = func(vmName string, migrationMode kubevirtv1.MigrationMode) {
 			GinkgoHelper()
 			By("checking the VM live-migrated correctly")
-			vmi := &kubevirtv1.VirtualMachineInstance{
+			dstVMI := &kubevirtv1.VirtualMachineInstance{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: namespace,
 					Name:      vmName,
 				},
 			}
-			err := dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
-			Expect(err).NotTo(HaveOccurred(), "should success retrieving vmi")
-			currentNode := vmi.Status.NodeName
+			Expect(dstClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred(), 
+			"should success retrieving vmi on source cluster")
+			srcClusterVMICurrentNode := dstVMI.Status.NodeName
 
 			Eventually(func() *kubevirtv1.VirtualMachineInstanceMigrationState {
-				err := dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
-				Expect(err).NotTo(HaveOccurred())
-				return vmi.Status.MigrationState
+				Expect(dstClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+				return dstVMI.Status.MigrationState
 			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(BeNil(), "should have a MigrationState")
 			Eventually(func() string {
-				err := crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
-				Expect(err).NotTo(HaveOccurred())
-				return vmi.Status.MigrationState.TargetNode
-			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(Equal(currentNode), "should refresh MigrationState")
+				Expect(crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+				return dstVMI.Status.MigrationState.TargetNode
+			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(Equal(srcClusterVMICurrentNode), "should refresh MigrationState")
 			Eventually(func() bool {
-				err := crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
-				Expect(err).NotTo(HaveOccurred())
-				return vmi.Status.MigrationState.Completed
+				Expect(crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+				return dstVMI.Status.MigrationState.Completed
 			}).WithPolling(time.Second).WithTimeout(20*time.Minute).Should(BeTrue(), "should complete migration")
-			Expect(dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)).To(Succeed())
-			Expect(vmi.Status.MigrationState.SourcePod).NotTo(BeEmpty())
+			Expect(dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).To(Succeed())
+			Expect(dstVMI.Status.MigrationState.SourcePod).NotTo(BeEmpty())
 			Eventually(func() corev1.PodPhase {
 				sourcePod := &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: namespace,
-						Name:      vmi.Status.MigrationState.SourcePod,
+						Name:      dstVMI.Status.MigrationState.SourcePod,
 					},
 				}
-				err = crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(sourcePod), sourcePod)
-				Expect(err).NotTo(HaveOccurred())
+				Expect(crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(sourcePod), sourcePod)).NotTo(HaveOccurred())
 				return sourcePod.Status.Phase
 			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Equal(corev1.PodSucceeded), "should move source pod to Completed")
-			err = dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)
-			Expect(err).NotTo(HaveOccurred(), "should success retrieving vmi after migration")
-			Expect(vmi.Status.MigrationState.Failed).To(BeFalse(), func() string {
-				vmiJSON, err := json.Marshal(vmi)
+			Expect(dstClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred(), "should success retrieving vmi after migration")
+			Expect(dstVMI.Status.MigrationState.Failed).To(BeFalse(), func() string {
+				vmiJSON, err := json.Marshal(dstVMI)
 				if err != nil {
 					return fmt.Sprintf("failed marshaling migrated VM: %v", vmiJSON)
 				}
 				return fmt.Sprintf("should live migrate successfully: %s", string(vmiJSON))
 			})
-			Expect(vmi.Status.MigrationState.Mode).To(Equal(migrationMode), "should be the expected migration mode %s", migrationMode)
+			Expect(dstVMI.Status.MigrationState.Mode).To(Equal(migrationMode), "should be the expected migration mode %s", migrationMode)
 		}
 		ccliveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
+			GinkgoHelper()
 			ccLiveMigrateVirtualMachine(vmi.Name)
 			checkCCLiveMigrationSucceeded(vmi.Name, kubevirtv1.MigrationPreCopy)
 		}
@@ -1457,6 +1481,16 @@ fi
 			return nil
 		}
 
+		clientCreateCUDN = func(c crclient.Client, d dynamic.Interface, cudn *udnv1.ClusterUserDefinedNetwork) {
+			GinkgoHelper()
+			By("Creating ClusterUserDefinedNetwork")
+			Expect(c.Create(context.Background(), cudn)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(c.Delete(context.Background(), cudn)).To(Succeed())
+			})
+			Eventually(clusterUserDefinedNetworkReadyFunc(d, cudn.Name), 5*time.Second, time.Second).Should(Succeed())
+		}
+
 		createCUDN = func(cudn *udnv1.ClusterUserDefinedNetwork) {
 			GinkgoHelper()
 			By("Creating ClusterUserDefinedNetwork")
@@ -1507,7 +1541,7 @@ fi
 		srcClient, err = newControllerRuntimeClientFromEnvVar("SRC_CLUSTER_CONF")
 		Expect(err).NotTo(HaveOccurred())
 
-		srcClient, err = newControllerRuntimeClientFromEnvVar("DST_CLUSTER_CONF")
+		dstClient, err = newControllerRuntimeClientFromEnvVar("DST_CLUSTER_CONF")
 		Expect(err).NotTo(HaveOccurred())
 
 		virtClient, err = kubevirt.NewClient("/tmp")
@@ -1923,7 +1957,7 @@ write_files:
 
 			if td.topology == udnv1.NetworkTopologyLocalnet {
 				By("setting up the localnet underlay")
-				Expect(providerCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+				Expect(providerCtx.SetupUnderlay(fr.ClientSet, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
 			}
 			createCUDN(cudn)
 
@@ -2414,12 +2448,39 @@ password: fedora
 chpasswd: { expire: False }
 `
 		)
-		DescribeTable("should maintain tcp connection with minimal downtime", func(td func(vmi *kubevirtv1.VirtualMachineInstance)) {
+		FDescribeTable("should maintain tcp connection with minimal downtime", func(td func(vmi *kubevirtv1.VirtualMachineInstance)) {
+			By("Creating test framwork and clientset for destionation cluster")
+			dstClunsterConf, exist := os.LookupEnv("DST_CLUSTER_CONF")
+			Expect(exist).To(BeTrue())
+			dstCfg, err := clientcmd.BuildConfigFromFlags("", dstClunsterConf)
+			Expect(err).ToNot(HaveOccurred())
+			dstClientset := kubernetes.NewForConfigOrDie(dstCfg)
+			dstDynamicClient := dynamic.NewForConfigOrDie(dstCfg)
+
+			By("creating same test namespace on destination cluster")
+			dstNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			Expect(dstClient.Create(context.Background(), dstNamespace)).To(Succeed())
+
+			// ---
+
 			By("setting up the localnet underlay")
 			cudn, networkName := kubevirt.GenerateCUDN(namespace, "net1", udnv1.NetworkTopologyLocalnet, udnv1.NetworkRoleSecondary, udnv1.DualStackCIDRs{})
-			createCUDN(cudn)
+			cudnCopy := cudn.DeepCopy()
+			clientCreateCUDN(srcClient, fr.DynamicClient, cudn)
+			clientCreateCUDN(dstClient, dstDynamicClient, cudnCopy)
 
-			Expect(providerCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+			Expect(providerCtx.SetupUnderlay(fr.ClientSet, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+
+			ogFrCtl := fr.ClientSet
+			fr.ClientSet = dstClientset
+			ogKubeConf := e2eframework.TestContext.KubeConfig
+			e2eframework.TestContext.KubeConfig = dstClunsterConf
+			ogKubeHost := e2eframework.TestContext.Host
+			e2eframework.TestContext.Host = "https://127.0.0.1:43563"
+			Expect(providerCtx.SetupUnderlay(dstClientset, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+			fr.ClientSet = ogFrCtl
+			e2eframework.TestContext.KubeConfig  = ogKubeConf
+			e2eframework.TestContext.Host = ogKubeHost
 
 			workerNodeList, err := fr.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{LabelSelector: labels.FormatLabels(map[string]string{"node-role.kubernetes.io/worker": ""})})
 			Expect(err).NotTo(HaveOccurred())

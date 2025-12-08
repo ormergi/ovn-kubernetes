@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/client-go/kubernetes"
 )
 
 // Provider represents the infrastructure provider
@@ -63,7 +63,7 @@ type Context interface {
 	AttachNetwork(network Network, instance string) (NetworkInterface, error)
 	DetachNetwork(network Network, instance string) error
 	GetAttachedNetworks() (Networks, error)
-	SetupUnderlay(f *framework.Framework, underlay Underlay) error
+	SetupUnderlay(clientset kubernetes.Interface, underlay Underlay) error
 
 	AddCleanUpFn(func() error)
 }

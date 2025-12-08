@@ -1228,11 +1228,13 @@ if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
   deploy_frr_external_container
   deploy_bgp_external_server
 fi
+#skip those if last iternation timeout
 build_ovn_image
 detect_apiserver_url
 create_ovn_kube_manifests
 install_ovn_image
 install_ovn
+
 if [ "$KIND_INSTALL_INGRESS" == true ]; then
   install_ingress
 fi
