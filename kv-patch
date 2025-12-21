@@ -1,0 +1,12 @@
+{
+    "spec": {
+        "configuration": {
+            "developerConfiguration": {
+                "featureGates": ["DecentralizedLiveMigration"]
+            },
+            "migrations": {
+                "network": "migration-br"
+            }
+        }
+    }
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -356,8 +357,15 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 				for _, serverPodIP := range serverPodIPs {
 					output, err := virtClient.RunCommand(vmi, fmt.Sprintf("iperf3 -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &", podName, serverPodIP), polling)
 					if err != nil {
-						return fmt.Errorf("%s: %w", output, err)
-					}
+						o, err2 := virtClient.RunCommand(vmi, fmt.Sprintf("cat /tmp/%[1]s_%[2]s_iperf3.log &", podName, serverPodIP), polling)
+						fmt.Println("#########")
+						fmt.Printf("dump %[1]s_%[2]s_iperf3.log\n", podName, serverPodIP)
+						fmt.Println("#########")
+						fmt.Println(o)
+						fmt.Println("#########")
+						errs := errors.Join(err, err2)
+						return fmt.Errorf("%s: %w", output, errs)
+					} 
 				}
 			}
 			return nil
@@ -514,6 +522,9 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 					WithPolling(200 * time.Millisecond).
 					Should(HaveLen(1))
 				for _, ip := range networkStatuses[0].IPs {
+					if utilnet.IsIPv6(net.ParseIP(ip)) {
+						continue
+					}
 					ips[pod.Name] = append(ips[pod.Name], ip)
 				}
 			}
@@ -711,7 +722,7 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			dstVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:    namespace,
-						GenerateName: vmName,
+						Name: vmName,
 					},
 					Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
 						VMIName: vmName,
@@ -736,7 +747,7 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			srcVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:    namespace,
-						GenerateName: vmName,
+						Name: vmName,
 					},
 					Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
 						VMIName: vmName,
@@ -759,22 +770,24 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
 		}
 
-		checkCCLiveMigrationSucceeded = func(vmName string, migrationMode kubevirtv1.MigrationMode) {
-			GinkgoHelper()
+		checkCCLiveMigrationSucceeded = func(vmName string, migrationMode kubevirtv1.MigrationMode) {		
+			By("Waiting for migration to complete")
+			currentDestVMIM := &kubevirtv1.VirtualMachineInstanceMigration{ObjectMeta: metav1.ObjectMeta{Namespace:    namespace,Name: vmName,},}
+			Eventually(func(g Gomega) {
+				g.Expect(dstClient.Get(context.Background(),crclient.ObjectKeyFromObject(currentDestVMIM), currentDestVMIM)).To(Succeed())
+				g.Expect(currentDestVMIM.Status.Phase).To(Equal(kubevirtv1.MigrationSucceeded))
+			}).WithPolling(3*time.Second).WithTimeout(10*time.Minute).Should(Succeed(),"live migration should complete ")
+			
 			By("checking the VM live-migrated correctly")
-			dstVMI := &kubevirtv1.VirtualMachineInstance{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace,
-					Name:      vmName,
-				},
-			}
-			Expect(dstClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred(), 
-			"should success retrieving vmi on source cluster")
-			srcClusterVMICurrentNode := dstVMI.Status.NodeName
-
-			Eventually(func() *kubevirtv1.VirtualMachineInstanceMigrationState {
+			srcVMI := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace,Name:  vmName,}}
+			srcClusterVMICurrentNode := srcVMI.Status.NodeName
+			Expect(srcClient.Get(context.Background(), crclient.ObjectKeyFromObject(srcVMI), srcVMI)).To(Succeed(), "should success retrieving vmi on source cluster")
+			dstVMI := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace,Name:  vmName,}}
+			Expect(dstClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).To(Succeed(), "should success retrieving vmi on destination cluster")
+			
+			Eventually(func() []kubevirtv1.VirtualMachineInstanceCondition {
 				Expect(dstClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
-				return dstVMI.Status.MigrationState
+				return dstVMI.Status.Conditions
 			}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(BeNil(), "should have a MigrationState")
 			Eventually(func() string {
 				Expect(crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
@@ -806,8 +819,8 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			})
 			Expect(dstVMI.Status.MigrationState.Mode).To(Equal(migrationMode), "should be the expected migration mode %s", migrationMode)
 		}
+		
 		ccliveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
-			GinkgoHelper()
 			ccLiveMigrateVirtualMachine(vmi.Name)
 			checkCCLiveMigrationSucceeded(vmi.Name, kubevirtv1.MigrationPreCopy)
 		}
@@ -2476,7 +2489,7 @@ chpasswd: { expire: False }
 			ogKubeConf := e2eframework.TestContext.KubeConfig
 			e2eframework.TestContext.KubeConfig = dstClunsterConf
 			ogKubeHost := e2eframework.TestContext.Host
-			e2eframework.TestContext.Host = "https://127.0.0.1:43563"
+			e2eframework.TestContext.Host = "https://127.0.0.1:41325"
 			Expect(providerCtx.SetupUnderlay(dstClientset, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
 			fr.ClientSet = ogFrCtl
 			e2eframework.TestContext.KubeConfig  = ogKubeConf
