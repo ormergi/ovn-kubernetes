@@ -72,12 +72,26 @@ func safeExpectBatchWithResponse(virtctlPath string, vmi *v1.VirtualMachineInsta
 	return resp, err
 }
 
-func (virtctl *Client) RunCommand(vmi *v1.VirtualMachineInstance, command string, timeout time.Duration) (string, error) {
-	return runCommand(virtctl.path, vmi, command, timeout)
+func safeExpectBatchWithResponseWithKubeConf(virtctlPath, virtctlCfg string, vmi *v1.VirtualMachineInstance, expected []expect.Batcher, timeout time.Duration) ([]expect.BatchRes, error) {
+	expecter, _, err := newExpecterWithKubeconfing(virtctlPath,virtctlCfg, vmi, consoleConnectionTimeout, expect.Verbose(true), expect.VerboseWriter(GinkgoWriter))
+	if err != nil {
+		return nil, err
+	}
+	defer expecter.Close()
+
+	resp, err := expectBatchWithValidatedSend(expecter, expected, timeout)
+	if err != nil {
+		GinkgoLogr.Error(err, fmt.Sprintf("%v", resp), "vmi", vmi.ObjectMeta)
+	}
+	return resp, err
 }
 
-func runCommand(virtctlPath string, vmi *v1.VirtualMachineInstance, command string, timeout time.Duration) (string, error) {
-	results, err := safeExpectBatchWithResponse(virtctlPath, vmi, []expect.Batcher{
+func (virtctl *Client) RunCommand(vmi *v1.VirtualMachineInstance, command string, timeout time.Duration) (string, error) {
+	return runCommand(virtctl.path, virtctl.kubeconfig, vmi, command, timeout)
+}
+
+func runCommand(virtctlPath, kubeconf string, vmi *v1.VirtualMachineInstance, command string, timeout time.Duration) (string, error) {
+	results, err := safeExpectBatchWithResponseWithKubeConf(virtctlPath, kubeconf, vmi, []expect.Batcher{
 		&expect.BSnd{S: "\n"},
 		&expect.BExp{R: PromptExpression},
 		&expect.BSnd{S: command + "\n"},
@@ -108,13 +122,27 @@ func skipInput(scanner *bufio.Scanner) bool {
 }
 
 // newExpecter will connect to an already logged in VMI console and return the generated expecter it will wait `timeout` for the connection.
+func newExpecterWithKubeconfing(
+	virtctlPath string,
+	kubeconfig string,
+	vmi *v1.VirtualMachineInstance,
+	timeout time.Duration,
+	opts ...expect.Option,
+	) (expect.Expecter, <-chan error, error) {
+	virtctlCmd := []string{virtctlPath}
+	if kubeconfig != "" {
+		virtctlCmd = append(virtctlCmd, "--kubeconfig", kubeconfig)
+	}
+	virtctlCmd = append(virtctlCmd, "console", "-n", vmi.Namespace, vmi.Name)
+	return expect.SpawnWithArgs(virtctlCmd, timeout, expect.SendTimeout(timeout), expect.Verbose(true), expect.VerboseWriter(GinkgoWriter))
+}
+
 func newExpecter(
 	virtctlPath string,
 	vmi *v1.VirtualMachineInstance,
 	timeout time.Duration,
 	opts ...expect.Option) (expect.Expecter, <-chan error, error) {
-	virtctlCmd := []string{virtctlPath, "console", "-n", vmi.Namespace, vmi.Name}
-	return expect.SpawnWithArgs(virtctlCmd, timeout, expect.SendTimeout(timeout), expect.Verbose(true), expect.VerboseWriter(GinkgoWriter))
+	return newExpecterWithKubeconfing(virtctlPath, "", vmi, timeout, opts...)
 }
 
 // expectBatchWithValidatedSend adds the expect.BSnd command to the exect.BExp expression.
@@ -179,12 +207,11 @@ func expectBatchWithValidatedSend(expecter expect.Expecter, batch []expect.Batch
 }
 
 func (virtctl *Client) LoginToFedora(vmi *kubevirtv1.VirtualMachineInstance, user, password string) error {
-	return loginToFedoraWithHostname(virtctl.path, vmi, user, password, vmi.Name)
+	return loginToFedoraWithHostname(virtctl.path, virtctl.kubeconfig, vmi, user, password, vmi.Name)
 }
 
-// LoginToFedora performs a console login to a Fedora base VM
-func loginToFedoraWithHostname(virtctlPath string, vmi *kubevirtv1.VirtualMachineInstance, user, password, hostname string) error {
-	expecter, _, err := newExpecter(virtctlPath, vmi, consoleConnectionTimeout, expect.Verbose(true), expect.VerboseWriter(GinkgoWriter))
+func loginToFedoraWithHostname(virtctlPath, kubeconfig string, vmi *kubevirtv1.VirtualMachineInstance, user, password, hostname string) error {
+	expecter, _, err := newExpecterWithKubeconfing(virtctlPath, kubeconfig, vmi, consoleConnectionTimeout, expect.Verbose(true), expect.VerboseWriter(GinkgoWriter))
 	if err != nil {
 		return err
 	}

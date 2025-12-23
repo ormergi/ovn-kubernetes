@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"os"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/ovn-org/ovn-kubernetes/test/e2e/containerengine"
@@ -20,9 +21,13 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	utilnet "k8s.io/utils/net"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+		"k8s.io/client-go/tools/clientcmd"
+			"k8s.io/client-go/kubernetes"
+
+
 )
 
 // IsProvider returns true if clusters provider is KinD
@@ -366,7 +371,13 @@ func (c *contextKind) getAttachedNetworks() (api.Networks, error) {
 	return attachedNetworks, nil
 }
 
-func (c *contextKind) SetupUnderlay(ctl kubernetes.Interface, underlay api.Underlay) error {
+func (c *contextKind) SetupUnderlay(fr *framework.Framework, underlay api.Underlay) error {
+	destCfg, err := clientcmd.BuildConfigFromFlags("", os.Getenv("DST_CLUSTER_CONF"))
+	if err != nil { 
+		return fmt.Errorf("failed to create dest cluster clientset: %v", err)
+	}
+	destClusterClient := kubernetes.NewForConfigOrDie(destCfg)
+	
 	if underlay.LogicalNetworkName == "" {
 		return fmt.Errorf("underlay logical network name must be set")
 	}
@@ -383,7 +394,7 @@ func (c *contextKind) SetupUnderlay(ctl kubernetes.Interface, underlay api.Under
 		ovsKubeNodeLabel = "app=ovnkube-node"
 	)
 
-	ovsPodList, err := ctl.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).List(
+	ovsPodList, err := fr.ClientSet.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).List(
 		context.Background(),
 		metav1.ListOptions{LabelSelector: ovsKubeNodeLabel},
 	)
@@ -401,8 +412,25 @@ func (c *contextKind) SetupUnderlay(ctl kubernetes.Interface, underlay api.Under
 				return fmt.Errorf("failed to get underlay interface for network %s on node %s: %w", underlay.PhysicalNetworkName, ovsPod.Spec.NodeName, err)
 			}
 			c.AddCleanUpFn(func() error {
-				if err := removeOVSBridge(ovsPod.Namespace, ovsPod.Name, underlay.BridgeName); err != nil {
+				_, err := fr.ClientSet.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).Get(context.Background(), ovsPod.Name, metav1.GetOptions{})
+				if err != nil && apierrors.IsNotFound(err) {
+					originalFrameworkClient := fr.ClientSet
+					originalKubeConf := framework.TestContext.KubeConfig
+					originalKubeHost := framework.TestContext.Host
+					fr.ClientSet = destClusterClient
+					framework.TestContext.KubeConfig = os.Getenv("DST_CLUSTER_CONF")
+					framework.TestContext.Host = os.Getenv("DST_CLUSTER_API_URL")
+					err := removeOVSBridge(ovsPod.Namespace, ovsPod.Name, underlay.BridgeName)
+					fr.ClientSet = originalFrameworkClient
+					framework.TestContext.KubeConfig = originalKubeConf
+					framework.TestContext.Host = originalKubeHost
+					if err != nil {
 					return fmt.Errorf("failed to remove OVS bridge %s for pod %s/%s during cleanup: %w", underlay.BridgeName, ovsPod.Namespace, ovsPod.Name, err)
+					}
+				} else {
+					if err := removeOVSBridge(ovsPod.Namespace, ovsPod.Name, underlay.BridgeName); err != nil {
+						return fmt.Errorf("failed to remove OVS bridge %s for pod %s/%s during cleanup: %w", underlay.BridgeName, ovsPod.Namespace, ovsPod.Name, err)
+					}
 				}
 				return nil
 			})
@@ -420,12 +448,33 @@ func (c *contextKind) SetupUnderlay(ctl kubernetes.Interface, underlay api.Under
 			}
 		}
 		c.AddCleanUpFn(func() error {
-			if err := configureBridgeMappings(
-				ovsPod.Namespace,
-				ovsPod.Name,
-				defaultNetworkBridgeMapping(),
-			); err != nil {
-				return fmt.Errorf("failed to restore default bridge mappings for pod %s/%s during cleanup: %w", ovsPod.Namespace, ovsPod.Name, err)
+			_, err := fr.ClientSet.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).Get(context.Background(), ovsPod.Name, metav1.GetOptions{})
+			if err != nil && apierrors.IsNotFound(err) {
+				originalFrameworkClient := fr.ClientSet
+				originalKubeConf := framework.TestContext.KubeConfig
+				originalKubeHost := framework.TestContext.Host
+				fr.ClientSet = destClusterClient
+				framework.TestContext.KubeConfig = os.Getenv("DST_CLUSTER_CONF")
+				framework.TestContext.Host = os.Getenv("DST_CLUSTER_API_URL")
+				err := configureBridgeMappings(
+					ovsPod.Namespace,
+					ovsPod.Name,
+					defaultNetworkBridgeMapping(),
+				)
+				fr.ClientSet = originalFrameworkClient
+				framework.TestContext.KubeConfig = originalKubeConf
+				framework.TestContext.Host = originalKubeHost
+				if err != nil {
+					return fmt.Errorf("failed to restore default bridge mappings for pod %s/%s during cleanup: %w", ovsPod.Namespace, ovsPod.Name, err)
+				}
+			} else {
+				if err := configureBridgeMappings(
+					ovsPod.Namespace,
+					ovsPod.Name,
+					defaultNetworkBridgeMapping(),
+				); err != nil {
+					return fmt.Errorf("failed to restore default bridge mappings for pod %s/%s during cleanup: %w", ovsPod.Namespace, ovsPod.Name, err)
+				}
 			}
 			return nil
 		})

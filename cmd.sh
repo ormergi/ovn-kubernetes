@@ -336,8 +336,21 @@ client() {
 # podman save quay.io/sronanrh/iperf:latest -o img
 # kind load image-archive --name ovn1 ./img
 # kind load image-archive --name ovn2 ./img
+set -x
+i=0
+v=($(kubectl --kubeconfig=/root/ovn2.conf get vmim -A --no-headers -o custom-columns=:metadata.name,:metadata.namespace))
+for ((i=0; i< ${#v[@]}; i+=2)); do 
+  n=${v[$i]}
+  ns=${v[$i+1]}
+  echo "$n $ns"
+  kubectl --kubeconfig=/root/ovn2.conf delete vmim $n -n $ns
+  kubectl --kubeconfig=/root/ovn2.conf patch vmim $n -n $ns --type=merge -p '{"metadata":{"finalizers":null}}'
+  i=$((i+1))
+done
+kubectl --kubeconfig=/root/ovn2.conf get ns | grep kv-live | awk '{print $1}' | xargs kubectl --kubeconfig=/root/ovn2.conf delete ns | :
 
 (
+  export DST_CLUSTER_API_URL=$(kubectl --kubeconfig=$CLUSTER_2_CONF cluster-info | head -1 | grep -Po "https://127.0.0.1:\d+")
   export IPERF3_IMAGE="localhost:5000/sronanrh/iperf:latest"  
   export TEST_REPORT_DIR="./artifacts/"
   export FLAKE_ATTEMPTS=0
@@ -351,3 +364,4 @@ client() {
   export WHAT="Kubevirt Virtual Machines" 
   make -C test control-plane
 )
+
