@@ -1,0 +1,24 @@
+{
+    "spec": {
+        "certificateRotateStrategy": {
+            "selfSigned": {
+                "ca": {
+                    "duration": "9000h0m0s",
+                    "renewBefore": "4500h0m0s"
+                },
+                "server": {
+                    "duration": "8000h0m0s",
+                    "renewBefore": "4000h0m0s"
+                }
+            }
+        },
+        "configuration": {
+            "developerConfiguration": {
+                "featureGates": ["DecentralizedLiveMigration"]
+            },
+            "migrations": {
+                "network": "migration-br"
+            }
+        }
+    }
+}

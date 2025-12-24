@@ -1,0 +1,21 @@
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: migration-br
+  namespace: kubevirt
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "migration-br",
+      "type": "bridge",
+      "bridge": "br-mig",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "20.100.0.0/24",
+        "exclude": [
+          "20.100.0.1/32",
+          "20.100.0.128/25"
+        ]
+      }
+    }

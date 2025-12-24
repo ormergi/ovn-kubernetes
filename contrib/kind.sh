@@ -830,7 +830,13 @@ install_ovn_multiple_nodes_zones() {
   run_kubectl apply -f ovnkube-node.yaml
 }
 
+SKIP_INSTALL_OVN="${SKIP_INSTALL_OVN:-}"
 install_ovn() {
+  if [ -n "$SKIP_INSTALL_OVN" ]; then
+    echo "Skipping install ovn due to SKIP_INSTALL_OVN=$SKIP_INSTALL_OVN"
+    return
+  fi
+
   pushd ${MANIFEST_OUTPUT_DIR}
 
   run_kubectl apply -f k8s.ovn.org_egressfirewalls.yaml
@@ -1056,6 +1062,13 @@ detect_apiserver_url
 create_ovn_kube_manifests
 install_ovn_image
 install_ovn
+
+SKIP_DEPLOY_COMPONENTS=${SKIP_DEPLOY_COMPONENTS:-}
+if [ -n "$SKIP_DEPLOY_COMPONENTS" ]; then
+  sleep_until_pods_settle
+  exit 0
+fi
+
 if [ "$KIND_INSTALL_INGRESS" == true ]; then
   install_ingress
 fi

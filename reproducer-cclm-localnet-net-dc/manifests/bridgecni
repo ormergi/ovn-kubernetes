@@ -1,0 +1,74 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bridge-cni
+  labels:
+    tier: node
+    app: bridge-cni
+spec:
+  selector:
+    matchLabels:
+      name: bridge-cni
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        name: bridge-cni
+        tier: node
+        app: bridge-cni
+      annotations:
+        description: LinuxBridge installs 'bridge' CNI on cluster nodes, so it can be later used to attach Pods/VMs to Linux bridges
+    spec:
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: cni-plugins
+          image:  localhost:5000/kubevirt/cni-default-plugins:v1.5.1
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -ce
+            - |
+              cni_mount_dir=/opt/cni/bin
+              host_dir=/opt/cni/bin
+              components=("bridge")
+              for component in "${components[@]}"; do
+                if find "${cni_mount_dir}/${component}" &>/dev/null && ! test -L "${cni_mount_dir}/${component}"; then
+                  echo "${component} binary found, creating symbolic link ${cni_mount_dir}/cnv-${component}"
+                  ln -sf "${host_dir}/${component}" "${cni_mount_dir}/cnv-${component}"
+                else
+                  echo "installing cnv-${component}, and creating symbolic link ${cni_mount_dir}/${component}"
+
+                  sourcebinpath="/usr/src/github.com/containernetworking/plugins/bin"
+                  cp --remove-destination "${sourcebinpath}/${component}" "${cni_mount_dir}/cnv-${component}"
+
+                  printf -v component_checksum "%s" "$(<${sourcebinpath}/${component}.checksum)"
+                  printf "%s %s" "${component_checksum% *}" "${cni_mount_dir}/cnv-${component}" | sha256sum --check
+
+                  ln -sf "${host_dir}/cnv-${component}" "${cni_mount_dir}/${component}"
+                fi
+              done
+              echo 'Entering sleep... (success)'
+              sleep infinity
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "15Mi"
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: cnibin
+              mountPath: /opt/cni/bin
+            - name: tmp
+              mountPath: /tmp
+          terminationMessagePolicy: FallbackToLogsOnError
+      volumes:
+        - name: cnibin
+          hostPath:
+            path: /opt/cni/bin
+        - name: tmp
+          emptyDir: { }

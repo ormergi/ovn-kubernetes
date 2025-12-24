@@ -206,6 +206,7 @@ set_ovn_image() {
   fi
 }
 
+SKIP_OVN_BUILD=${SKIP_OVN_BUILD:-}
 build_ovn_image() {
   local push_args=""
   if [ "$OCI_BIN" == "podman" ]; then
@@ -216,8 +217,12 @@ build_ovn_image() {
   if [ "$OVN_IMAGE" == local ]; then
     set_ovn_image
 
-    # Build image
-    make -C ${DIR}/../dist/images IMAGE="${OVN_IMAGE}" OVN_REPO="${OVN_REPO}" OVN_GITREF="${OVN_GITREF}" OCI_BIN="${OCI_BIN}" fedora-image
+    if [ -n "$SKIP_OVN_BUILD" ]; then
+      echo "Skipping ovn build due to env var SKIP_OVN_BUILD=$SKIP_OVN_BUILD.."
+    else
+      # Build image
+      make -C ${DIR}/../dist/images IMAGE="${OVN_IMAGE}" OVN_REPO="${OVN_REPO}" OVN_GITREF="${OVN_GITREF}" OCI_BIN="${OCI_BIN}" fedora-image
+    fi 
 
     # store in local registry
     if [ "$KIND_LOCAL_REGISTRY" == true ];then
@@ -288,7 +293,13 @@ command_exists() {
   command -v ${cmd} >/dev/null 2>&1
 }
 
+API_URL=${API_URL:-}
+SKIP_INSTALL_OVN="${SKIP_INSTALL_OVN:-}"
 detect_apiserver_url() {
+  if [ -n "$SKIP_INSTALL_OVN" ]; then
+    echo "Skipping install ovn due to SKIP_INSTALL_OVN=$SKIP_INSTALL_OVN"
+    return
+  fi
   # Detect API_URL used for in-cluster communication
   #
   # This will return apiserver address in format https://<node-name>:<port>
@@ -614,8 +625,7 @@ install_kubevirt() {
         {"op":"add","path":"/spec/configuration/virtualMachineOptions","value":{}},
         {"op":"add","path":"/spec/configuration/virtualMachineOptions/disableSerialConsoleLog","value":{}},
         {"op":"add","path":"/spec/configuration/developerConfiguration","value":{"featureGates":[]}},
-        {"op":"add","path":"/spec/configuration/developerConfiguration/featureGates/-","value":"NetworkBindingPlugins"},
-        {"op":"add","path":"/spec/configuration/developerConfiguration/featureGates/-","value":"DynamicPodInterfaceNaming"},
+        {"op":"add","path":"/spec/configuration/developerConfiguration/featureGates/-","value":"DecentralizedLiveMigration"},
         {"op":"add","path":"/spec/configuration/network","value":{}},
         {"op":"add","path":"/spec/configuration/network/binding","value":{"l2bridge":{"domainAttachmentType":"managedTap","migration":{}}}}
     ]'
