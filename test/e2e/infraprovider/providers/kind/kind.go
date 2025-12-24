@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
+	cluster_context "github.com/ovn-org/ovn-kubernetes/test/e2e/cluster-context"
 	"github.com/ovn-org/ovn-kubernetes/test/e2e/containerengine"
 	"github.com/ovn-org/ovn-kubernetes/test/e2e/deploymentconfig"
 	"github.com/ovn-org/ovn-kubernetes/test/e2e/images"
@@ -19,8 +21,11 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/test/e2e/infraprovider/portalloc"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/test/e2e/framework"
 	utilnet "k8s.io/utils/net"
 )
@@ -487,8 +492,7 @@ func (c *contextKind) SetupUnderlay(f *framework.Framework, underlay api.Underla
 	if underlay.BridgeName == "" {
 		underlay.BridgeName = secondaryBridge
 	}
-
-	c.AddCleanUpFn(func() error {
+	cleanupFn := func() error {
 		// Find the OVS pods again to cover cases that restart the PODs
 		ovsPods, err := findOVSPods(f)
 		if err != nil {
@@ -509,12 +513,36 @@ func (c *contextKind) SetupUnderlay(f *framework.Framework, underlay api.Underla
 			}
 		}
 		return nil
-	})
+	}
 
 	ovsPods, err := findOVSPods(f)
 	if err != nil {
 		return fmt.Errorf("failed finding OVS pods during kind underlay setup: %w", err)
 	}
+
+	c.AddCleanUpFn(func() error {
+		// check on which cluster the  function is executed
+		_, err := f.ClientSet.CoreV1().Pods(deploymentconfig.Get().OVNKubernetesNamespace()).Get(context.Background(), ovsPods[0].Name, metav1.GetOptions{})
+		if err != nil && apierrors.IsNotFound(err) { // run on target cluster
+			targetCfg, err := clientcmd.BuildConfigFromFlags("", os.Getenv("TARGET_CLUSTER_CONF"))
+			if err != nil {
+				return fmt.Errorf("failed to create target cluster clientset: %v", err)
+			}
+			if err = cluster_context.Exec(
+				f,
+				kubernetes.NewForConfigOrDie(targetCfg),
+				os.Getenv("TARGET_CLUSTER_CONF"),
+				os.Getenv("TARGET_CLUSTER_API_URL"),
+				cleanupFn,
+			); err != nil {
+				return fmt.Errorf("failed to clean up on target cluster: %v", err)
+			}
+		} else { // run on source cluster
+			return cleanupFn()
+		}
+		return nil
+	})
+
 	for _, ovsPod := range ovsPods {
 		if underlay.BridgeName != deploymentconfig.Get().ExternalBridgeName() {
 			underlayInterface, err := getNetworkInterface(ovsPod.Spec.NodeName, underlay.PhysicalNetworkName)
