@@ -670,7 +670,7 @@ install_kubevirt_ipam_controller() {
   echo "Installing KubeVirt IPAM controller manager ..."
   manifest="https://github.com/kubevirt/ipam-extensions/releases/download/v0.3.1/install.yaml"
   run_kubectl apply -f "$manifest"
-  kubectl wait -n kubevirt-ipam-controller-system deployment kubevirt-ipam-controller-manager --for condition=Available --timeout 2m
+  kubectl wait -n kubevirt-ipam-controller-system deployment kubevirt-ipam-controller-manager --for condition=Available --timeout 5m
 }
 
 install_multus() {
