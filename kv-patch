@@ -1,5 +1,17 @@
 {
     "spec": {
+        "certificateRotateStrategy": {
+            "selfSigned": {
+                "ca": {
+                    "duration": "1000h0m0s",
+                    "renewBefore": "500h0m0s"
+                },
+                "server": {
+                    "duration": "500h0m0s",
+                    "renewBefore": "250h0m0s"
+                }
+            }
+        },
         "configuration": {
             "developerConfiguration": {
                 "featureGates": ["DecentralizedLiveMigration"]

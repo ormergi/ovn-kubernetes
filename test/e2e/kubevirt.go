@@ -3,12 +3,11 @@ package e2e
 import (
 	"bufio"
 	"context"
-	"math/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -191,6 +190,8 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 
 	type execFnType = func(cmd string) (string, error)
 
+	const iperfIntervalSeconds = 0.1
+
 	var (
 		sendEcho = func(conn *net.TCPConn) error {
 			strEcho := "Halo"
@@ -361,16 +362,9 @@ var _ = FDescribe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fu
 			polling := 15 * time.Second
 			for podName, serverPodIPs := range serverPodIPsByName {
 				for _, serverPodIP := range serverPodIPs {
-					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &", podName, serverPodIP), polling)
+					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 -V -i %[3]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &", podName, serverPodIP, iperfIntervalSeconds), polling)
 					if err != nil {
-						o, err2 := vclt.RunCommand(vmi, fmt.Sprintf("cat /tmp/%[1]s_%[2]s_iperf3.log &", podName, serverPodIP), polling)
-						fmt.Println("#########")
-						fmt.Printf("dump %[1]s_%[2]s_iperf3.log\n", podName, serverPodIP)
-						fmt.Println("#########")
-						fmt.Println(o)
-						fmt.Println("#########")
-						errs := errors.Join(err, err2)
-						return fmt.Errorf("%s: %w", output, errs)
+						return fmt.Errorf("%s: %w", output, err)
 					} 
 				}
 			}
@@ -1381,6 +1375,7 @@ passwd:
 			return pods
 		}
 
+		iperfIntervalStr = fmt.Sprintf("%f",iperfIntervalSeconds)
 		iperfServerScript = `
 #!/bin/bash -xe
 iface=$(ifconfig  |grep flags |grep -v "eth0\|lo" | sed "s/: .*//")
@@ -1388,7 +1383,7 @@ iface=${iface:-eth0}
 
 ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed "s#/.*##")
 if [ "$ipv4" != "" ]; then
-	iperf3 -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
+	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv4}_iperf3.log; then
 		cat /tmp/test_${ipv4}_iperf3.log
@@ -1403,7 +1398,7 @@ while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
 	cnt=$((cnt+1))
 done
 if [ "$ipv6" != "" ]; then
-	iperf3 -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
+	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv6}_iperf3.log; then
 		cat /tmp/test_${ipv6}_iperf3.log 1>&2
@@ -2630,7 +2625,7 @@ chpasswd: { expire: False }
 				}
 			}
 
-			By("Calculate network outage time on post migration")
+			By("Calculate network outage intervals on post migration")
 			results := map[string]int{}
 			searchStr := "0.00 Bytes  0.00 bits/sec"
 			err = filepath.WalkDir(testDirPath, func(path string, d fs.DirEntry, err error) error {
@@ -2643,14 +2638,21 @@ chpasswd: { expire: False }
 			})
 			Expect(err).ToNot(HaveOccurred())
 
-			const postCCLMNetworkOutageSeconds = 3
-			for _, networkOutageSeconds := range results {
-				Expect(networkOutageSeconds).To(BeNumerically("<=", postCCLMNetworkOutageSeconds),
-				fmt.Sprintf("the migrated VM had network dissconnect exceed the acceptable network downtime (%ds):\n%v",
-					postCCLMNetworkOutageSeconds, composeTestResultTable(results)))
+			testResults := composeTestResultTable(results)
+			p := fmt.Sprintf("%s/%s", testDirPath, "test-stats")
+			Expect(os.WriteFile(p, []byte(testResults), 0o644)).To(Succeed())
+
+			const acceptableNetworkOutageSeconds = 3
+			Expect(err).ToNot(HaveOccurred())
+			Expect(iperfIntervalSeconds).ToNot(BeZero())
+			acceptableNetworkOutageIntervals := acceptableNetworkOutageSeconds / iperfIntervalSeconds 
+			for _, networkOutageIntervals := range results {
+				Expect(networkOutageIntervals).To(BeNumerically("<=", acceptableNetworkOutageIntervals),
+				fmt.Sprintf("the migrated VM had network dissconnect exceed the acceptable network downtime (%f intervals):\n%v",
+					acceptableNetworkOutageIntervals, testResults))
 			}
 		},
-			Entry("after succeeded live migration", liveMigrateSucceed),
+			FEntry("after succeeded live migration", liveMigrateSucceed),
 			Entry("after failed live migration", liveMigrateFailed),
 			FEntry("after succeeded cross-cluster live migration", ccliveMigrateSucceed),
 		)
@@ -2873,8 +2875,8 @@ func execFnInClusterContext (
 
 func composeTestResultTable(results map[string]int) string {
 	sb := strings.Builder{}
-	sb.WriteString(fmt.Sprintf("%-79s | %-5s\n", "test", "network outage (seconds)"))
-	sb.WriteString(fmt.Sprintf("%s\n", strings.Repeat("-", 85)))
+	sb.WriteString(fmt.Sprintf("%-79s | %-5s\n", "test", "network outage (intervals)"))
+	sb.WriteString(fmt.Sprintf("%s\n", strings.Repeat("-", 100)))
 	for path, count := range results {
 		sb.WriteString(fmt.Sprintf("%-79s | %-5d\n", path, count))
 	}

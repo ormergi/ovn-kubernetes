@@ -2,8 +2,7 @@
 
 set -e
 
-# spike cross cluster migration over localnet issues.sh
-# https://github.com/ovn-kubernetes/ovn-kubernetes/blob/master/test/e2e/kubevirt.go
+# spike: cross cluster migration and localnet
 
 CRI_BIN=${CRI_BIN:-podman}
 
@@ -17,23 +16,12 @@ CLUSTER_2="ovn2"
 CLUSTER_1_CONF="${HOME}/${CLUSTER_1}.conf"
 CLUSTER_2_CONF="${HOME}/${CLUSTER_2}.conf"
 
-NAMESPACE="blue"
-
-KUBEVIRT_VERSION="v1.7.0-beta.0"
-
-VM_IMAGE_US="quay.io/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
-VM_IMAGE="localhost:5000/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
-VM_IMAGE_LOCAL="localhost:5000/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
-
-VM_NAME_DST="testvmi-dst"
-VM_NAME_SRC="testvmi-src"
+KUBEVIRT_VERSION="v1.7.0"
 
 MIGRATION_NETWORK="migration"
 MIGRATION_NAD="migration-br"
 MIGRATION_BR="br-mig"
 MIGRATION_IFACE="eth2"
-
-VMIM_DST="testvmi-dst"
 
 alias k1="kubectl --kubeconfig $CLUSTER_1_CONF"
 alias k2="kubectl --kubeconfig $CLUSTER_2_CONF"
@@ -42,30 +30,37 @@ alias kv2="kubectl --kubeconfig $CLUSTER_2_CONF -n kubevirt"
 alias kovn1="kubectl --kubeconfig $CLUSTER_1_CONF -n ovn-kubernetes"
 alias kovn2="kubectl --kubeconfig $CLUSTER_2_CONF -n ovn-kubernetes"
 
-dependencies() {
-  #requirements=(pip3 openssl wget virtctl)
-  #pip_reqs=(jinjanator)
+# test vars
+NAMESPACE="blue"
 
-  if ! which wget &> /dev/null; then
-    dnf install wget
-  fi 
+VM_NAME_DST="testvmi-dst"
+VM_NAME_SRC="testvmi-src"
 
-  if ! which openssl &> /dev/null; then
-    dnf install openssl
-  fi 
-  
-  if ! which pip3 &> /dev/null; then
-    dnf install pip3
-  fi 
+VMIM_DST="testvmi-dst"
 
-  if ! which jinjanate &> /dev/null; then
-    pip3 install jinjanator
-  fi 
+VM_IMAGE_US="quay.io/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
+VM_IMAGE="localhost:5000/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
+VM_IMAGE_LOCAL="localhost:5000/kubevirt/fedora-with-test-tooling-container-disk:v1.6.2"
+
+ensure_prequisites() {
+  local -r rpms=("curl" "pip3" "openssl" "skopeo")
+  for p in "${rpms[@]}"; do 
+    if ! which $p &> /dev/null; then
+      dnf install $p
+    fi 
+  done
+
+  local -r pip_libs=("jinjanator")
+  for p in "${pip_libs[@]}"; do 
+    if ! which $p &> /dev/null; then
+      pip install jinjanator
+    fi 
+  done
 
   if ! which virtctl &> /dev/null; then 
     echo "install virtctl"
     v=$(curl https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt)
-    wget https://github.com/kubevirt/kubevirt/releases/download/${v}/virtctl-${v}-linux-amd64
+    curl -L https://github.com/kubevirt/kubevirt/releases/download/${v}/virtctl-${v}-linux-amd64 -O
     chmod +x "virtctl-$v-linux-amd64"
     cp virtctl-$v-linux-amd64 /usr/bin/virtctl
   fi 
@@ -73,6 +68,10 @@ dependencies() {
 
 up() {
     sysctl -w fs.inotify.max_user_instances=1024
+    
+    # ovn-k automation create the container runtime "underlay" network with random subnet.
+    # create the network in advance with no IPAM.
+    setup_underlay_network
 
     export KUBEVIRT_VERSION
 
@@ -105,6 +104,7 @@ up() {
       clusters+=($cluster_name)
     done
 
+    # mirror components images to local registy to shorten components readiness time
     whereabouts_img="k8snetworkplumbingwg/whereabouts:latest"
     echo "Mirror $whereabouts_img to local registry.."
     skopeo copy "docker://ghcr.io/${whereabouts_img}" "docker://localhost:5000/${whereabouts_img}" --dest-tls-verify=false
@@ -119,7 +119,7 @@ up() {
 
     for c in ${clusters[@]}; do
       setup_migration_network $c
-      setup_underlay_network $c
+      wire_ovn_underlay_network $c
     done
 
     echo "Creating migration network NAD on source cluster ($CLUSTER_1).."
@@ -132,7 +132,6 @@ up() {
       client $c patch -n kubevirt kubevirt kubevirt --type merge --patch-file ./kv-patch 
     done
 
-    
     for c in ${clusters[@]}; do
       echo "wating for pods readiness ($c)..."
       client $c wait kubevirt -n kubevirt kubevirt --for condition=Available=true --timeout 20m
@@ -143,9 +142,24 @@ up() {
     exchange_kubevirt_certificates $CLUSTER_1_CONF $CLUSTER_2_CONF
 }
 
+install_bridge_cni() {
+  local cluster_name="$1"
+  echo "Installing Bridge CNI plugin using kubeconfig: ${cluster_name}"
+  client $cluster_name apply -f ./brcni -n kube-system
+}
+
+install_whereabouts() {
+  local cluster_name="$1"
+  echo "Installing Whereabouts CNI plugin using kubeconfig: ${cluster_name}"
+  client $cluster_name apply -f ./whereaboutscni
+  client $cluster_name apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/whereabouts/refs/heads/master/doc/crds/whereabouts.cni.cncf.io_ippools.yaml
+  client $cluster_name apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/whereabouts/refs/heads/master/doc/crds/whereabouts.cni.cncf.io_overlappingrangeipreservations.yaml
+}
+
 setup_migration_network() {
   echo "create migration network (20.100.0.0/24).."
-  $CRI_BIN network create --driver bridge --subnet 20.100.0.0/24 $MIGRATION_NETWORK |:
+  $CRI_BIN network delete $MIGRATION_NETWORK
+  $CRI_BIN network create --driver bridge --ipam-driver=none --subnet 20.100.0.0/24 $MIGRATION_NETWORK |:
     
   nodes=$(client $1 get no --no-headers -o custom-columns=:.metadata.name)
   for n in $nodes; do 
@@ -159,6 +173,11 @@ setup_migration_network() {
 }
 
 setup_underlay_network() {
+    $CRI_BIN network delete underlay
+    $CRI_BIN network create --driver bridge --ipam-driver=none underlay
+}
+
+wire_ovn_underlay_network() {
     local -r ovs_pods=$(client $1 -n ovn-kubernetes get pod -l app=ovs-node --no-headers -o custom-columns=:.metadata.name)
     for p in $ovs_pods; do 
         client $1 -n ovn-kubernetes exec $p -- ovs-vsctl add-br $BR_NAME |:
@@ -167,21 +186,8 @@ setup_underlay_network() {
     done
 }
 
-install_whereabouts() {
-  local cluster_name="$1"
-  echo "Installing Whereabouts CNI plugin using kubeconfig: ${cluster_name}"
-  client $cluster_name apply -f ./whereaboutscni
-  client $cluster_name apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/whereabouts/refs/heads/master/doc/crds/whereabouts.cni.cncf.io_ippools.yaml
-  client $cluster_name apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/whereabouts/refs/heads/master/doc/crds/whereabouts.cni.cncf.io_overlappingrangeipreservations.yaml
-}
-
-install_bridge_cni() {
-  local cluster_name="$1"
-  echo "Installing Bridge CNI plugin using kubeconfig: ${cluster_name}"
-  client $cluster_name apply -f ./brcni -n kube-system
-}
-
 exchange_kubevirt_certificates() {
+    # source https://github.com/openperouter/openperouter/blob/749dc3a2bbb5da0c4a429b933b629219a81ed606/examples/evpn/multi-cluster/prepare.sh#L91
     local -r kubeconfig_a="$1"
     local -r kubeconfig_b="$2"
 
@@ -336,6 +342,8 @@ client() {
 # podman save quay.io/sronanrh/iperf:latest -o img
 # kind load image-archive --name ovn1 ./img
 # kind load image-archive --name ovn2 ./img
+
+# clean up leftovers 
 set -x
 i=0
 v=($(kubectl --kubeconfig=/root/ovn2.conf get vmim -A --no-headers -o custom-columns=:metadata.name,:metadata.namespace))
@@ -349,19 +357,22 @@ for ((i=0; i< ${#v[@]}; i+=2)); do
 done
 kubectl --kubeconfig=/root/ovn2.conf get ns | grep kv-live | awk '{print $1}' | xargs kubectl --kubeconfig=/root/ovn2.conf delete ns | :
 
-(
-  export DST_CLUSTER_API_URL=$(kubectl --kubeconfig=$CLUSTER_2_CONF cluster-info | head -1 | grep -Po "https://127.0.0.1:\d+")
-  export IPERF3_IMAGE="localhost:5000/sronanrh/iperf:latest"  
-  export TEST_REPORT_DIR="./artifacts/"
-  export FLAKE_ATTEMPTS=0
-  export KUBECONFIG=$(realpath $CLUSTER_1_CONF)
-  export SRC_CLUSTER_CONF=$(realpath $CLUSTER_1_CONF) 
-  export DST_CLUSTER_CONF=$(realpath $CLUSTER_2_CONF)
-  export CONTAINER_RUNTIME=$CRI_BIN 
-  export PLATFORM_IPV4_SUPPORT=true PLATFORM_IPV6_SUPPORT=true
-  export ENABLE_MULTI_NET=true
-  export ENABLE_NETWORK_SEGMENTATION=true
-  export WHAT="Kubevirt Virtual Machines" 
-  make -C test control-plane
-)
-
+for i in $(seq 5); do
+  echo "####### iteration $i #########"
+  (
+    export DST_CLUSTER_API_URL=$(kubectl --kubeconfig=$CLUSTER_2_CONF cluster-info | head -1 | grep -Po "https://127.0.0.1:\d+")
+    export IPERF3_IMAGE="localhost:5000/sronanrh/iperf:latest"  
+    export TEST_REPORT_DIR="./artifacts/"
+    export FLAKE_ATTEMPTS=0
+    export KUBECONFIG=$(realpath $CLUSTER_1_CONF)
+    export SRC_CLUSTER_CONF=$(realpath $CLUSTER_1_CONF) 
+    export DST_CLUSTER_CONF=$(realpath $CLUSTER_2_CONF)
+    export CONTAINER_RUNTIME=$CRI_BIN 
+    export PLATFORM_IPV4_SUPPORT=true PLATFORM_IPV6_SUPPORT=true
+    export ENABLE_MULTI_NET=true
+    export ENABLE_NETWORK_SEGMENTATION=true
+    export WHAT="Kubevirt Virtual Machines" 
+    make -C test control-plane || :
+  )
+    echo "####### ############ #########"
+done
