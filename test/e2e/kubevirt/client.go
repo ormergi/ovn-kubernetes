@@ -15,10 +15,11 @@ import (
 )
 
 type Client struct {
-	path string
+	path       string
+	kubeconfig string
 }
 
-func NewClient(cliDir string) (*Client, error) {
+func NewClient(cliDir, kubeconfig string) (*Client, error) {
 	// Ensure the virtctl directory exists.
 	if err := os.MkdirAll(cliDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create virtctl directory %q: %w", cliDir, err)
@@ -29,7 +30,7 @@ func NewClient(cliDir string) (*Client, error) {
 		return nil, fmt.Errorf("failed to ensure virtctl: %w", err)
 	}
 
-	return &Client{path: filepath.Join(cliDir, "virtctl")}, nil
+	return &Client{path: filepath.Join(cliDir, "virtctl"), kubeconfig: kubeconfig}, nil
 }
 
 func (virtctl *Client) RestartVirtualMachine(vmi *kubevirtv1.VirtualMachineInstance) (string, error) {
