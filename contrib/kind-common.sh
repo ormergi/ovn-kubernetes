@@ -550,9 +550,9 @@ delete_metallb_dir() {
 # Last, it will do the same with all pods in the kube-system namespace.
 kubectl_wait_pods() {
   # IPv6 cluster seems to take a little longer to come up, so extend the wait time.
-  OVN_TIMEOUT=300
+  OVN_TIMEOUT=800
   if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
-    OVN_TIMEOUT=480
+    OVN_TIMEOUT=1660
   fi
 
   # We will make sure that we timeout all commands at current seconds + the desired timeout.
