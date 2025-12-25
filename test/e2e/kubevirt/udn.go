@@ -66,3 +66,32 @@ func GenerateCUDN(namespace, name string, topology udnv1.NetworkTopology, role u
 
 	return cudn, networkName
 }
+
+func GenerateCUDNLocalnet(namespace, name string, networkName string) *udnv1.ClusterUserDefinedNetwork {
+	return &udnv1.ClusterUserDefinedNetwork{
+		ObjectMeta: metav1.ObjectMeta{
+			// Generate a unique name for the CUDN by combining the namespace and name and add
+			// a label with the same value for easy identification, for example at the RouteAdvertisement
+			// CUDN selector
+			Name: namespace + "-" + name,
+			Labels: map[string]string{
+				"name": namespace + "-" + name,
+			},
+		},
+		Spec: udnv1.ClusterUserDefinedNetworkSpec{
+			NamespaceSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "kubernetes.io/metadata.name",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{namespace},
+			}}},
+			Network: udnv1.NetworkSpec{
+				Topology: udnv1.NetworkTopologyLocalnet,
+				Localnet: &udnv1.LocalnetConfig{
+					Role:                udnv1.NetworkRoleSecondary,
+					IPAM:                &udnv1.IPAMConfig{Mode: udnv1.IPAMDisabled},
+					PhysicalNetworkName: networkName,
+				},
+			},
+		},
+	}
+}
