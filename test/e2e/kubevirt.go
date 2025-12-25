@@ -1,19 +1,26 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"math/rand"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	cluster_context "github.com/ovn-org/ovn-kubernetes/test/e2e/cluster-context"
 	"gopkg.in/yaml.v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
@@ -41,11 +48,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 	e2eframework "k8s.io/kubernetes/test/e2e/framework"
+	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
@@ -68,8 +77,8 @@ import (
 	kvmigrationsv1alpha1 "kubevirt.io/api/migrations/v1alpha1"
 )
 
-func newControllerRuntimeClient() (crclient.Client, error) {
-	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+func newControllerRuntimeClient(envVar string) (crclient.Client, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv(envVar))
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +364,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				return lastIperfLogLine, nil
 			}).
 				WithPolling(50*time.Millisecond).
-				WithTimeout(2*time.Second).
+				WithTimeout(2*time.Minute).
 				Should(
 					SatisfyAll(
 						ContainSubstring(" sec "),
@@ -365,18 +374,23 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				)
 		}
 
-		checkEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, podIPsByName map[string][]string, stage string) {
+		checkEastWestIperfTrafficWithClient = func(vclt *kubevirt.Client, vmi *kubevirtv1.VirtualMachineInstance, podIPsByName map[string][]string, stage string) {
 			GinkgoHelper()
 			for podName, podIPs := range podIPsByName {
 				for _, podIP := range podIPs {
 					iperfLogFile := fmt.Sprintf("/tmp/%s_%s_iperf3.log", podName, podIP)
 					execFn := func(cmd string) (string, error) {
-						return virtClient.RunCommand(vmi, cmd, 2*time.Second)
+						return vclt.RunCommand(vmi, cmd, 2*time.Second)
 					}
 					checkIperfTraffic(iperfLogFile, execFn, stage)
 				}
 			}
 		}
+		checkEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, podIPsByName map[string][]string, stage string) {
+			GinkgoHelper()
+			checkEastWestIperfTrafficWithClient(virtClient, vmi, podIPsByName, stage)
+		}
+
 		startNorthSouthIperfTraffic = func(execFn execFnType, addresses []string, port int32, logPrefix, stage string) error {
 			GinkgoHelper()
 			Expect(addresses).NotTo(BeEmpty())
@@ -787,6 +801,16 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
 		}
 
+		deleteVirtualMachine = func(vm *kubevirtv1.VirtualMachine) {
+			GinkgoHelper()
+			By(fmt.Sprintf("Delete virtual machine %s", vm.Name))
+			Expect(crClient.Delete(context.Background(), vm)).To(Succeed())
+			Eventually(func() bool {
+				err := crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vm), vm)
+				return err != nil && apierrors.IsNotFound(err)
+			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(BeTrue())
+		}
+
 		createVirtualMachineInstance = func(vmi *kubevirtv1.VirtualMachineInstance) {
 			GinkgoHelper()
 			By(fmt.Sprintf("Create virtual machine instance %s", vmi.Name))
@@ -803,9 +827,9 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
 		}
 
-		waitVirtualMachineInstanceReadinessWith = func(vmi *kubevirtv1.VirtualMachineInstance, conditionStatus corev1.ConditionStatus) {
+		waitVirtualMachineInstanceReadinessWith = func(vmi *kubevirtv1.VirtualMachineInstance, conditionType kubevirtv1.VirtualMachineInstanceConditionType, conditionStatus corev1.ConditionStatus) {
 			GinkgoHelper()
-			By(fmt.Sprintf("Waiting for readiness=%q at virtual machine %s", conditionStatus, vmi.Name))
+			By(fmt.Sprintf("Waiting for virtual machine %q condition type=%q status=%q", vmi.Name, conditionType, conditionStatus))
 			Eventually(func() []kubevirtv1.VirtualMachineInstanceCondition {
 				err := crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi), vmi)
 				Expect(err).To(SatisfyAny(
@@ -815,19 +839,19 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				return vmi.Status.Conditions
 			}).WithPolling(time.Second).WithTimeout(5 * time.Minute).Should(
 				ContainElement(SatisfyAll(
-					HaveField("Type", kubevirtv1.VirtualMachineInstanceReady),
+					HaveField("Type", conditionType),
 					HaveField("Status", conditionStatus),
 				)))
 		}
 
 		waitVirtualMachineInstanceReadiness = func(vmi *kubevirtv1.VirtualMachineInstance) {
 			GinkgoHelper()
-			waitVirtualMachineInstanceReadinessWith(vmi, corev1.ConditionTrue)
+			waitVirtualMachineInstanceReadinessWith(vmi, kubevirtv1.VirtualMachineInstanceReady, corev1.ConditionTrue)
 		}
 
 		waitVirtualMachineInstanceFailed = func(vmi *kubevirtv1.VirtualMachineInstance) {
 			GinkgoHelper()
-			waitVirtualMachineInstanceReadinessWith(vmi, corev1.ConditionFalse)
+			waitVirtualMachineInstanceReadinessWith(vmi, kubevirtv1.VirtualMachineInstanceReady, corev1.ConditionFalse)
 		}
 
 		waitVirtualMachineAddresses = func(vmi *kubevirtv1.VirtualMachineInstance) []kubevirt.Address {
@@ -1262,7 +1286,8 @@ fi
 			return ips, nil
 		}
 
-		createIperfServerPods = func(nodes []corev1.Node, udnName string, role udnv1.NetworkRole, staticSubnets []string) ([]*corev1.Pod, error) {
+		createIperfServerPods = func(nodes []corev1.Node, udnName string, role udnv1.NetworkRole, staticSubnets []string,
+			opts ...func(*corev1.Pod)) ([]*corev1.Pod, error) {
 			var pods []*corev1.Pod
 			for i, node := range nodes {
 				var nse *nadapi.NetworkSelectionElement
@@ -1276,12 +1301,16 @@ fi
 						IPRequest: staticIPs,
 					}
 				}
-				pod, err := createPod(fr, "testpod-"+sanitizeNodeName(node.Name), node.Name, namespace, []string{"bash", "-c"}, map[string]string{}, func(pod *corev1.Pod) {
+				pod, err := createPod(fr, "testpod-"+sanitizeNodeName(node.Name), "", namespace, []string{"bash", "-c"}, map[string]string{}, func(pod *corev1.Pod) {
 					if nse != nil {
 						pod.Annotations = networkSelectionElements(*nse)
 					}
 					pod.Spec.Containers[0].Image = images.Netshoot()
 					pod.Spec.Containers[0].Args = []string{iperfServerScript + "\n sleep infinity"}
+					pod.Spec.TerminationGracePeriodSeconds = ptr.To(int64(5))
+					for _, f := range opts {
+						f(pod)
+					}
 				})
 				if err != nil {
 					return nil, err
@@ -1366,6 +1395,17 @@ fi
 			return nil
 		}
 
+		clientCreateCUDN = func(c crclient.Client, d dynamic.Interface, cudn *udnv1.ClusterUserDefinedNetwork) {
+			GinkgoHelper()
+			By(fmt.Sprintf("Creating ClusterUserDefinedNetwork %q", cudn.Name))
+			Expect(c.Create(context.Background(), cudn)).To(Succeed())
+			DeferCleanup(func() {
+				By(fmt.Sprintf("Deleting ClusterUserDefinedNetwork %q", cudn.Name))
+				Expect(c.Delete(context.Background(), cudn)).To(Succeed())
+			})
+			Eventually(clusterUserDefinedNetworkReadyFunc(d, cudn.Name), 5*time.Second, time.Second).Should(Succeed())
+		}
+
 		createCUDN = func(cudn *udnv1.ClusterUserDefinedNetwork) {
 			GinkgoHelper()
 			By("Creating ClusterUserDefinedNetwork")
@@ -1410,10 +1450,10 @@ fi
 		providerCtx = infraprovider.Get().NewTestContext()
 
 		var err error
-		crClient, err = newControllerRuntimeClient()
+		crClient, err = newControllerRuntimeClient("KUBECONFIG")
 		Expect(err).NotTo(HaveOccurred())
 
-		virtClient, err = kubevirt.NewClient("/tmp")
+		virtClient, err = kubevirt.NewClient("/tmp", "")
 		Expect(err).NotTo(HaveOccurred())
 
 		nadClient, err = nadclient.NewForConfig(fr.ClientConfig())
@@ -2428,6 +2468,261 @@ chpasswd: { expire: False }
 		)
 	})
 
+	Context("live migration with localnet udn", Ordered, func() {
+		const (
+			podsCIDRv4Server = "172.31.0.10/24"
+			podsCIDRv6Server = "2010:100:200::10/60"
+			podIPv6Server    = "2010:100:200::10"
+			vmiCIDRv4        = "172.31.0.100/24"
+			vmiCIDRv6        = "2010:100:200::100/60"
+			vmiMAC           = "0A:58:0A:80:00:64"
+
+			networkName = "mynet"
+
+			crossClusterMigrationScope = "cross-cluster"
+			localMigrationScope        = "cluster-local"
+
+			serverPodLabel = "test-server"
+		)
+
+		var (
+			infraCtx infraapi.Context
+
+			sourceClusterKubeConf string
+			targetClusterHost     string
+			targetClusterKubeConf string
+			rootTestReportDir     string
+			testReportDir         string
+			// target cluster clients, used for kubevirt cross-cluster live migration test
+			targetClusterClientset  *kubernetes.Clientset
+			targetDynamicClient     *dynamic.DynamicClient
+			targetClusterClient     crclient.Client
+			targetClusterVirtClient *kubevirt.Client
+
+			testServerPods []*corev1.Pod
+			vmi            *kubevirtv1.VirtualMachineInstance
+			cudnName       string
+			vmCIDRs        []string
+			podsCIDRs      []string
+
+			startTime time.Time
+		)
+
+		fr.SkipNamespaceCreation = true
+
+		BeforeAll(func() {
+			sourceClusterKubeConf = os.Getenv("KUBECONFIG")
+			Expect(sourceClusterKubeConf).ToNot(BeEmpty(), "KUBECONFIG env var unset")
+			targetClusterHost = os.Getenv("TARGET_CLUSTER_API_URL")
+			Expect(targetClusterHost).ToNot(BeEmpty(), "TARGET_CLUSTER_API_URL env var unset")
+			targetClusterKubeConf = os.Getenv("TARGET_CLUSTER_CONF")
+			Expect(targetClusterKubeConf).ToNot(BeEmpty(), "TARGET_CLUSTER_CONF env var unset")
+			rootTestReportDir = os.Getenv("TEST_REPORT_DIR")
+			Expect(rootTestReportDir).ToNot(BeEmpty(), "TEST_REPORT_DIR env var unset")
+
+			targetClusterClientConfig, err := clientcmd.BuildConfigFromFlags("", targetClusterKubeConf)
+			Expect(err).ToNot(HaveOccurred())
+			targetClusterClientset = kubernetes.NewForConfigOrDie(targetClusterClientConfig)
+			targetDynamicClient = dynamic.NewForConfigOrDie(targetClusterClientConfig)
+			targetClusterClient, err = newControllerRuntimeClient("TARGET_CLUSTER_CONF")
+			Expect(err).NotTo(HaveOccurred())
+			targetClusterVirtClient, err = kubevirt.NewClient("/tmp", os.Getenv("TARGET_CLUSTER_CONF"))
+			Expect(err).NotTo(HaveOccurred())
+
+			podsCIDRs = filterCIDRs(fr.ClientSet, podsCIDRv4Server, podsCIDRv6Server)
+			vmCIDRs = filterCIDRs(fr.ClientSet, vmiCIDRv4, vmiCIDRv6)
+		})
+
+		BeforeEach(func() {
+			infraCtx = infraprovider.Get().NewTestContext()
+			startTime = time.Now()
+			By("Setup underlay network on source cluster")
+			Expect(infraCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+			By("Setup underlay network on target cluster")
+			// SetupUnderlay relays on env clients the e2e test suite detect, which is the source cluster client.
+			// switch e2e test suite clients to use target cluster clients and setup underlay network on target cluster.
+			err := cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
+				return infraCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			namespace = uniqueMetaName("kv-test-migration-localnet")
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			By("Creating namespace at source cluster")
+			Expect(crClient.Create(context.Background(), ns.DeepCopy())).To(Succeed())
+			By("Creating namespace at target cluster")
+			Expect(targetClusterClient.Create(context.Background(), ns.DeepCopy())).To(Succeed())
+			DeferCleanup(func() {
+				By("Deleting namespaces")
+				Expect(crClient.Delete(context.Background(), ns)).To(Succeed())
+				Expect(targetClusterClient.Delete(context.Background(), ns)).To(Succeed())
+			})
+
+			By("Creating tests CUDN")
+			testCUDN := kubevirt.GenerateCUDNLocalnet(namespace, "net1", networkName)
+			cudnCopy := testCUDN.DeepCopy()
+			clientCreateCUDN(crClient, fr.DynamicClient, testCUDN)
+			clientCreateCUDN(targetClusterClient, targetDynamicClient, cudnCopy)
+			cudnName = testCUDN.Name
+
+			By("Create test VM on source cluster")
+			networkData, err := newNetworkData(vmCIDRs)
+			Expect(err).NotTo(HaveOccurred())
+			netSrcCudn := kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: cudnName}}
+			vm := fedoraWithTestToolingVM(nil, nil, nil, netSrcCudn, "", networkData)
+			vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress = vmiMAC
+			createVirtualMachine(vm)
+			DeferCleanup(func() { deleteVirtualMachine(vm) })
+
+			By("Create test server pods")
+			workerNodes, err := fr.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{LabelSelector: labels.FormatLabels(map[string]string{"node-role.kubernetes.io/worker": ""})})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(workerNodes.Items).NotTo(BeEmpty(), "no worker nodes found")
+			selectedNode := workerNodes.Items[rand.Intn(len(workerNodes.Items)-1)]
+			testServerPods, err = createIperfServerPods([]corev1.Node{selectedNode}, cudnName, udnv1.NetworkRoleSecondary, podsCIDRs, func(p *corev1.Pod) {
+				p.ObjectMeta.Labels = map[string]string{"app": serverPodLabel}
+			})
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				for _, p := range testServerPods {
+					Expect(deletePodWithWait(context.Background(), fr.ClientSet, p)).To(Succeed())
+				}
+			})
+
+			step := by(vm.Name, "Wait for VM readiness")
+			vmi = &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: vm.Name}}
+			waitVirtualMachineInstanceReadinessWith(vmi, kubevirtv1.VirtualMachineInstanceAgentConnected, corev1.ConditionTrue)
+			step = by(vm.Name, "Login to virtual machine for the first time")
+			Eventually(func() error {
+				return virtClient.LoginToFedora(vmi, "fedora", "fedora")
+			}).WithTimeout(5*time.Second).WithPolling(time.Second).Should(Succeed(), step)
+			step = by(vm.Name, "Fetch updated VMI on source cluster")
+			Expect(crClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi), vmi)).To(Succeed(), step)
+		})
+
+		var ccliveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
+			ccLiveMigrateVirtualMachine(crClient, targetClusterClient, namespace, vmi.Name)
+			checkCCLiveMigrationSucceeded(crClient, targetClusterClient, namespace, vmi.Name)
+		}
+
+		DescribeTable("should maintain tcp connection with minimal downtime", func(testMigrationScope string, td func(vmi *kubevirtv1.VirtualMachineInstance)) {
+			testReportDir = rootTestReportDir + "/" + testMigrationScope
+			Expect(os.MkdirAll(testReportDir, 0o755)).To(Succeed())
+
+			step := by(vmi.Name, "Check east/west traffic before virtual machine instance live migration")
+			cudnNetStatusKey := podNetworkStatusByNetConfigPredicate(namespace, cudnName, "secondary")
+			testPodsIPs := podsMultusNetworkIPs(testServerPods, cudnNetStatusKey)
+			Expect(testPodsIPs).NotTo(BeEmpty(), "no test pod IPs found")
+			Expect(startEastWestIperfTraffic(vmi, testPodsIPs, step)).To(Succeed(), step)
+			checkEastWestIperfTraffic(vmi, testPodsIPs, step)
+
+			by(vmi.Name, "Running live migration for virtual machine instance")
+			td(vmi)
+
+			path := fmt.Sprintf("%s/source/%s/post-lm", testReportDir, namespace)
+			writeFilesFn, err := writeObjectsYamlWithCallback(sourceClusterKubeConf, namespace, path, "vmis", "vmims", "pods")
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				if err := writeFilesFn(); err != nil {
+					fmt.Println(err)
+				}
+			}()
+
+			currentVirtClient := virtClient
+			if testMigrationScope == crossClusterMigrationScope {
+				// At this point the VM is active on the target cluster. Switch test clients to the target cluster ones.
+				currentVirtClient = targetClusterVirtClient
+			}
+
+			step = by(vmi.Name, "Check east/west traffic after virtual machine instance live migration")
+			checkEastWestIperfTrafficWithClient(currentVirtClient, vmi, testPodsIPs, step)
+
+			step = by(vmi.Name, "Stop server traffic")
+			output, err := currentVirtClient.RunCommand(vmi, "killall --wait iperf3", 5*time.Second)
+			Expect(err).ToNot(HaveOccurred(), step, output)
+
+			logs := map[string]string{}
+			for _, pod := range testServerPods {
+				step := by(pod.Name, "Fetch server pods logs")
+				netStatus, err := podNetworkStatus(pod, cudnNetStatusKey)
+				Expect(err).ToNot(HaveOccurred(), step)
+				for _, ip := range netStatus[0].IPs {
+					logFile := fmt.Sprintf("/tmp/test_%s_iperf3.log", ip)
+					logContent, err := e2ekubectl.RunKubectl(pod.Namespace, "exec", pod.Name, "--", "cat", logFile)
+					Expect(err).ToNot(HaveOccurred())
+					logs[logFile] = logContent
+				}
+			}
+
+			By("Writing server logs")
+			serverLogsDir := testReportDir + "/server"
+			Expect(os.MkdirAll(serverLogsDir, 0o755)).To(Succeed())
+			for fileName, content := range logs {
+				Expect(os.WriteFile(serverLogsDir+"/"+fileName, []byte(content), 0o644)).To(Succeed())
+			}
+			By("Parse server logs")
+			results, err := parseIperfLogs(serverLogsDir, 1, testMigrationScope, podIPv6Server)
+			Expect(err).ToNot(HaveOccurred())
+			By("Writing test results")
+			resultsJSON, err := json.MarshalIndent(results, "", " ")
+			Expect(err).ToNot(HaveOccurred())
+			p := fmt.Sprintf("%s/%s", testReportDir, "test-stats.json")
+			Expect(os.WriteFile(p, resultsJSON, 0o644)).To(Succeed())
+
+			By("Assert post migration network stun time")
+			const maxNetworkOutageOnPostMigrationSeconds = 2
+			for _, actualNetworkOutageSeconds := range results {
+				Expect(actualNetworkOutageSeconds.Result).To(BeNumerically("<=", maxNetworkOutageOnPostMigrationSeconds),
+					fmt.Sprintf("the migrated VM had network disconnect exceed the acceptable network downtime:\n%v\n", resultsJSON))
+			}
+		},
+			Entry("after succeeded live migration", localMigrationScope, liveMigrateSucceed),
+			Entry("after succeeded cross-cluster live migration", crossClusterMigrationScope, ccliveMigrateSucceed),
+		)
+
+		JustAfterEach(func() {
+			r := "PASS"
+			if CurrentSpecReport().Failed() {
+				r = "FAILED"
+			}
+			By("Writing test result: " + r)
+			if err := os.WriteFile(testReportDir+"/"+r, []byte(r), 0o644); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump test namespace object state from source cluster")
+			types := []string{"vms", "vmis", "vmims", "pods"}
+			dir := fmt.Sprintf("%s/source/%s", testReportDir, namespace)
+			if err := writeObjectsYaml(sourceClusterKubeConf, namespace, dir, types...); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump test namespace object state from target cluster")
+			dir = fmt.Sprintf("%s/target/%s", testReportDir, namespace)
+			if err := writeObjectsYaml(targetClusterKubeConf, namespace, dir, types...); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump test namespace pods logs from source cluster")
+			dir = fmt.Sprintf("%s/source/%s/logs", testReportDir, namespace)
+			if err := writePodLogs(context.Background(), clientSet, namespace, dir, startTime); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump test namespace pods logs from target cluster")
+			dir = fmt.Sprintf("%s/target/%s/logs", testReportDir, namespace)
+			if err := writePodLogs(context.Background(), targetClusterClientset, namespace, dir, startTime); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump OVN-K logs from source cluster")
+			dir = fmt.Sprintf("%s/source/ovn-kubernetes/logs", testReportDir)
+			if err := writePodLogs(context.Background(), clientSet, "ovn-kubernetes", dir, startTime); err != nil {
+				fmt.Println(err)
+			}
+			By("Dump OVN-K logs from target cluster")
+			dir = fmt.Sprintf("%s/target/ovn-kubernetes/logs", testReportDir)
+			if err := writePodLogs(context.Background(), targetClusterClientset, "ovn-kubernetes", dir, startTime); err != nil {
+				fmt.Println(err)
+			}
+		})
+	})
+
 	getIPAMClaimName := func(vmName, netName string) string {
 		return fmt.Sprintf("%s.%s", vmName, netName)
 	}
@@ -2786,3 +3081,305 @@ ethernets:
 		})
 	})
 })
+
+func ccLiveMigrateVirtualMachine(sourceClusterClient, targetClusterClient crclient.Client, namespace, vmName string) {
+	// the test assume source and target cluster has Kubeivrt certificate exchanged
+	// and a connected via migration network.
+	GinkgoHelper()
+	const migrationID = "cclm-test"
+
+	By("creating target VM from source VM spec")
+	srcVM := &kubevirtv1.VirtualMachine{}
+	Expect(sourceClusterClient.Get(context.Background(), crclient.ObjectKey{Namespace: namespace, Name: vmName}, srcVM)).To(Succeed())
+	spec := srcVM.Spec.DeepCopy()
+	spec.RunStrategy = ptr.To(kubevirtv1.RunStrategyWaitAsReceiver)
+	targetVM := &kubevirtv1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      srcVM.Name,
+			Namespace: namespace,
+		},
+		Spec: *spec,
+	}
+	targetVMCreationRetries := 0
+	Eventually(func() error {
+		if targetVMCreationRetries > 0 {
+			// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+			// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+			By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+		}
+		err := targetClusterClient.Create(context.Background(), targetVM)
+		targetVMCreationRetries++
+		return err
+	}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+
+	By("fetching target cluster kubevirt instance migration url")
+	kv := &kubevirtv1.KubeVirt{}
+	Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKey{Namespace: "kubevirt", Name: "kubevirt"}, kv)).To(Succeed())
+	migrationURL := kv.Status.SynchronizationAddresses[0]
+
+	By("creating VMIM on target cluster")
+	targetVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      vmName,
+		},
+		Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
+			VMIName: vmName,
+			Receive: &kubevirtv1.VirtualMachineInstanceMigrationTarget{
+				MigrationID: migrationID,
+			},
+		},
+	}
+	targetVMIMCreationRetries := 0
+	Eventually(func() error {
+		if targetVMIMCreationRetries > 0 {
+			// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+			// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+			By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+		}
+		err := targetClusterClient.Create(context.Background(), targetVMIM)
+		targetVMIMCreationRetries++
+		return err
+	}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+
+	By("creating VMIM on source cluster")
+	srcVMIM := &kubevirtv1.VirtualMachineInstanceMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      vmName,
+		},
+		Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{
+			VMIName: vmName,
+			SendTo: &kubevirtv1.VirtualMachineInstanceMigrationSource{
+				MigrationID: migrationID,
+				ConnectURL:  migrationURL,
+			},
+		},
+	}
+	srcVMIMICreationRetries := 0
+	Eventually(func() error {
+		if srcVMIMICreationRetries > 0 {
+			// retry due to unknown issue where kubevirt webhook gets stuck reading the request body
+			// https://github.com/ovn-org/ovn-kubernetes/issues/3902#issuecomment-1750257559
+			By(fmt.Sprintf("Retrying vmim %s creation", vmName))
+		}
+		err := sourceClusterClient.Create(context.Background(), srcVMIM)
+		srcVMIMICreationRetries++
+		return err
+	}).WithPolling(time.Second).WithTimeout(time.Minute).Should(Succeed())
+}
+
+func checkCCLiveMigrationSucceeded(sourceClusterClient, targetClusterClient crclient.Client, namespace, vmName string) {
+	currentDestVMIM := &kubevirtv1.VirtualMachineInstanceMigration{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: vmName}}
+	Eventually(func(g Gomega) {
+		g.Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(currentDestVMIM), currentDestVMIM)).To(Succeed())
+		g.Expect(currentDestVMIM.Status.Phase).To(Equal(kubevirtv1.MigrationSucceeded))
+	}).WithPolling(3*time.Second).WithTimeout(10*time.Minute).Should(Succeed(), "live migration should complete ")
+
+	By("checking the VM live-migrated correctly")
+	srcVMI := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: vmName}}
+	srcClusterVMICurrentNode := srcVMI.Status.NodeName
+	Expect(sourceClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(srcVMI), srcVMI)).To(Succeed(), "should success retrieving vmi on source cluster")
+	dstVMI := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: vmName}}
+	Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).To(Succeed(), "should success retrieving vmi on target cluster")
+
+	Eventually(func() []kubevirtv1.VirtualMachineInstanceCondition {
+		Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+		return dstVMI.Status.Conditions
+	}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(BeNil(), "should have a MigrationState")
+	Eventually(func() string {
+		Expect(sourceClusterClient.Get(context.TODO(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+		return dstVMI.Status.MigrationState.TargetNode
+	}).WithPolling(time.Second).WithTimeout(10*time.Minute).ShouldNot(Equal(srcClusterVMICurrentNode), "should refresh MigrationState")
+	Eventually(func() bool {
+		Expect(sourceClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred())
+		return dstVMI.Status.MigrationState.Completed
+	}).WithPolling(time.Second).WithTimeout(20*time.Minute).Should(BeTrue(), "should complete migration")
+	Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).To(Succeed())
+	Expect(dstVMI.Status.MigrationState.SourcePod).NotTo(BeEmpty())
+	// VM on source cluster is on Stop state - no virt-launcher pod exist
+	Expect(targetClusterClient.Get(context.Background(), crclient.ObjectKeyFromObject(dstVMI), dstVMI)).NotTo(HaveOccurred(), "should success retrieving vmi after migration")
+	Expect(dstVMI.Status.MigrationState.Failed).To(BeFalse(), func() string {
+		vmiJSON, err := json.Marshal(dstVMI)
+		if err != nil {
+			return fmt.Sprintf("failed marshaling migrated VM: %v", vmiJSON)
+		}
+		return fmt.Sprintf("should live migrate successfully: %s", string(vmiJSON))
+	})
+}
+
+const iperfNoNetConnPattern = "0.00 Bytes  0.00 bits/sec"
+
+type iperfResult struct {
+	MigrationScope string  `json:"migrationScope"`
+	IpFamily       int64   `json:"ipFamily"`
+	Result         float64 `json:"result"`
+	Log            string  `json:"log"`
+}
+
+func parseIperfLogs(
+	logsDir string,
+	iperfIntervalSeconds float64,
+	migrationScope string,
+	ipV6Pattern string,
+) (
+	[]iperfResult,
+	error,
+) {
+	var results []iperfResult
+	err := filepath.WalkDir(logsDir, func(path string, d fs.DirEntry, err error) error {
+		noConnLineCount, cerr := countMatchesInFile(path, iperfNoNetConnPattern)
+		if cerr != nil {
+			return err
+		}
+		netDCSeconds := float64(noConnLineCount) * iperfIntervalSeconds
+		ipFamily := int64(4)
+		if strings.Contains(path, ipV6Pattern) {
+			ipFamily = 6
+		}
+		results = append(results, iperfResult{
+			Result:         netDCSeconds,
+			MigrationScope: migrationScope,
+			IpFamily:       ipFamily,
+			Log:            path,
+		})
+		return nil
+	})
+	return results, err
+}
+
+func countMatchesInFile(filename, pattern string) (int, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		// TODO: Improve and find sequences of at least 5 occurrences in a row
+		//  for indicating post migration network outage, and not random drops.
+		//  It should allow using shorter sampling intervals and providing more
+		//  accurate results.
+		if strings.Contains(scanner.Text(), pattern) {
+			count++
+		}
+	}
+	if scanner.Err() != nil {
+		return 0, scanner.Err()
+	}
+	return count, nil
+}
+
+func newNetworkData(staticIPs []string) (string, error) {
+	type Ethernet struct {
+		Addresses []string `json:"addresses,omitempty"`
+	}
+	networkData, err := yaml.Marshal(&struct {
+		Version   int                 `json:"version,omitempty"`
+		Ethernets map[string]Ethernet `json:"ethernets,omitempty"`
+	}{
+		Version: 2,
+		Ethernets: map[string]Ethernet{
+			"eth0": {
+				Addresses: staticIPs,
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(networkData), nil
+}
+
+func breakpoint(p string) {
+	By("Before migration debug (run `touch " + p + "` to continue)")
+	fmt.Println(time.Now())
+	Eventually(func() error {
+		if _, err := os.Lstat(p); os.IsNotExist(err) {
+			return err
+		} else {
+			return nil
+		}
+	}).WithTimeout(time.Hour).WithPolling(time.Second * 3).Should(Succeed())
+}
+
+func writePodLogs(ctx context.Context, c kubernetes.Interface, namespace, path string, since time.Time) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	pods, err := c.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, pod := range pods.Items {
+		allContainers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
+		for _, container := range allContainers {
+			log, err := c.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+				SinceTime: ptr.To(metav1.NewTime(since)), Container: container.Name,
+			}).DoRaw(ctx)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			fileName := fmt.Sprintf("%s_%s.log", pod.Name, container.Name)
+			if err := os.WriteFile(path+"/"+fileName, log, 0o644); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func writeObjectsYaml(kubeconf, namespace, path string, types ...string) error {
+	writeFilesFn, err := writeObjectsYamlWithCallback(kubeconf, namespace, path, types...)
+	if err != nil {
+		return err
+	}
+	return writeFilesFn()
+}
+
+func writeObjectsYamlWithCallback(kubeconf, namespace, path string, types ...string) (func() error, error) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
+
+	const kubectl = "/usr/local/bin/kubectl"
+	var errs []error
+	filesContent := map[string][]byte{}
+	all, err := exec.Command(kubectl, "get", "all", "-o", "wide", "--kubeconfig", kubeconf, "-n", namespace).CombinedOutput()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	filesContent[path+"/all"] = all
+	events, err := exec.Command(kubectl, "get", "events", "-o", "wide", "--kubeconfig", kubeconf, "-n", namespace).CombinedOutput()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	filesContent[path+"/events"] = events
+
+	for _, objType := range types {
+		objYAML, err := exec.Command(kubectl, "get", objType, "-o", "yaml", "--kubeconfig", kubeconf, "-n", namespace).CombinedOutput()
+		if err != nil {
+			errs = append(errs, err)
+		}
+		fileName := fmt.Sprintf("%s.yaml", objType)
+		filesContent[path+"/"+fileName] = objYAML
+	}
+
+	writeFilesFn := func() error {
+		var werrs []error
+		for f, c := range filesContent {
+			if len(c) == 0 {
+				continue
+			}
+			if err := os.WriteFile(f, c, 0o644); err != nil {
+				werrs = append(werrs, err)
+			}
+		}
+		return errors.Join(werrs...)
+	}
+
+	return writeFilesFn, errors.Join(errs...)
+}
