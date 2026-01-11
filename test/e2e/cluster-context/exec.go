@@ -27,3 +27,23 @@ func Exec(
 	e2eframework.TestContext.Host = originalKubeHost
 	return err
 }
+
+func ExecOutput(
+	f *e2eframework.Framework,
+	kubeClient kubernetes.Interface,
+	kubeConf string,
+	kubeHost string,
+	fn func() (string, error),
+) (string, error){
+	originalFrameworkClient := f.ClientSet
+	originalKubeConf := e2eframework.TestContext.KubeConfig
+	originalKubeHost := e2eframework.TestContext.Host
+	f.ClientSet = kubeClient
+	e2eframework.TestContext.KubeConfig = kubeConf
+	e2eframework.TestContext.Host = kubeHost
+	output, err := fn()
+	f.ClientSet = originalFrameworkClient
+	e2eframework.TestContext.KubeConfig = originalKubeConf
+	e2eframework.TestContext.Host = originalKubeHost
+	return output, err
+}
