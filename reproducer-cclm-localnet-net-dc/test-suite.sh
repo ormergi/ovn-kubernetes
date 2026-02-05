@@ -41,6 +41,7 @@ LOCAL_REGISTRY="localhost:5000"
 VM_IMAGE="quay.io/kubevirtci/fedora-with-test-tooling:v20250416-e37573e"
 IPERF_IMAGE="docker.io/nicolaka/netshoot:v0.14"
 LOCAL_IPERF_IMAGE="localhost:5000/nicolaka/netshoot:v0.14"
+HTTPBIN_IMAGE="docker.io/kennethreitz/httpbin:latest"
 
 mirror_image_to_local_registry() {
   local -r image_tag="$1"
@@ -78,6 +79,7 @@ underlay_iface_name=$($OCI_BIN network inspect underlay -f {{.NetworkInterface}}
 
 mirror_image_to_local_registry $VM_IMAGE
 mirror_image_to_local_registry $IPERF_IMAGE
+mirror_image_to_local_registry $HTTPBIN_IMAGE
 cleanup_before_test_suite
 
 dest_cluster_url=$(kubectl --kubeconfig=$CLUSTER_TARGET_KUBECONF cluster-info | head -1 | grep -Po "https://127.0.0.1:\d+")

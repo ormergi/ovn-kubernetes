@@ -14,7 +14,7 @@
         },
         "configuration": {
             "developerConfiguration": {
-                "featureGates": ["DecentralizedLiveMigration"]
+                "featureGates": ["DecentralizedLiveMigration", "EnableVirtioFsStorageVolumes"]
             },
             "migrations": {
                 "network": "migration-br"
