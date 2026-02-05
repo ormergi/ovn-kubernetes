@@ -1,6 +1,7 @@
 package ovn
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -240,12 +241,17 @@ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod
 	var err error
 
 	if kubevirt.IsPodAllowedForMigration(pod, bsnc.GetNetInfo()) {
+		klog.Infof("DEBUG: pod %s/%s is migration pod", pod.Namespace, pod.Name)
 		kubevirtLiveMigrationStatus, err = kubevirt.DiscoverLiveMigrationStatus(bsnc.watchFactory, pod)
 		if err != nil {
 			return fmt.Errorf("failed to discover Live-migration status: %w", err)
 		}
+		o, _ := json.MarshalIndent(kubevirtLiveMigrationStatus, "", " ")
+		klog.Infof("DEBUG: kubevirtLiveMigrationStatus: %s", o)
 	}
 	updatePort := kubevirtLiveMigrationStatus != nil && pod.Name == kubevirtLiveMigrationStatus.TargetPod.Name
+
+	klog.Infof("DEBUG: updatePort: %v", updatePort)
 
 	if !addPort && !updatePort {
 		return nil
@@ -257,6 +263,7 @@ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod
 	if err != nil {
 		return err
 	}
+	klog.Infof("DEBUG: switchName: %v", switchName)
 
 	var activeNetwork util.NetInfo
 	if bsnc.IsPrimaryNetwork() {
@@ -296,6 +303,7 @@ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod
 			pod.Namespace, pod.Name, bsnc.GetNetworkName(), err)
 		return nil
 	}
+	klog.Infof("DEBUG: networkMap: %+v", networkMap)
 
 	if !on {
 		// the pod is not attached to this specific network
@@ -312,6 +320,7 @@ func (bsnc *BaseUserDefinedNetworkController) ensurePodForUserDefinedNetwork(pod
 
 	var errs []error
 	for nadKey, network := range networkMap {
+		klog.Infof("DEBUG: call addLogicalPortToNetworkForNAD for nadKey: %v network: %+v", nadKey, network)
 		if err = bsnc.addLogicalPortToNetworkForNAD(pod, nadKey, switchName, network, kubevirtLiveMigrationStatus); err != nil {
 			errs = append(errs, fmt.Errorf("failed to add logical port of Pod %s/%s for NAD key %s: %w", pod.Namespace, pod.Name, nadKey, err))
 		}
@@ -347,12 +356,16 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 		// multiple ops regarding the same object in the same transact, so passing enabled parameter.
 		lspEnabled = ptr.To(kubevirtLiveMigrationStatus.IsTargetDomainReady())
 	}
+	klog.Infof("DEBUG: addLogicalPortToNetworkForNAD: shouldHandleLiveMigration: %v", shouldHandleLiveMigration)
+	klog.Infof("DEBUG: addLogicalPortToNetworkForNAD: lspEnabled: %v", lspEnabled)
 
 	// we need to create a logical port for all local pods
 	// we also need to create a remote logical port for remote pods on layer2
 	// topologies with interconnect
 	isLocalPod := bsnc.isPodScheduledinLocalZone(pod)
 	requiresLogicalPort := isLocalPod || bsnc.isLayer2Interconnect()
+	klog.Infof("DEBUG:addLogicalPortToNetworkForNAD: isLocalPod: %v", isLocalPod)
+	klog.Infof("DEBUG:addLogicalPortToNetworkForNAD: requiresLogicalPort: %v", requiresLogicalPort)
 
 	if requiresLogicalPort {
 		ops, lsp, podAnnotation, newlyCreated, err = bsnc.addLogicalPortToNetwork(pod, nadKey, network, lspEnabled)
@@ -360,6 +373,8 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 			return err
 		}
 	} else if bsnc.TopologyType() == types.LocalnetTopology {
+		klog.Infof("DEBUG:addLogicalPortToNetworkForNAD: its localnet")
+
 		// On localnet networks, we might be processing the pod as a result of a
 		// node changing zone local -> remote so cleanup the logical port in
 		// case it exists and is no longer needed.
@@ -383,6 +398,7 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 		kubevirtLiveMigrationStatus.IsTargetDomainReady() &&
 		// At localnet there is no source pod remote LSP so it should be skipped
 		(bsnc.TopologyType() != types.LocalnetTopology || bsnc.isPodScheduledinLocalZone(kubevirtLiveMigrationStatus.SourcePod)) {
+		klog.Infof("DEBUG: addLogicalPortToNetworkForNAD: call disableLiveMigrationSourceLSPOps")
 		ops, err = bsnc.disableLiveMigrationSourceLSPOps(kubevirtLiveMigrationStatus, nadKey, ops)
 		if err != nil {
 			return fmt.Errorf("failed to create LSP ops for source pod during Live-migration status: %w", err)
