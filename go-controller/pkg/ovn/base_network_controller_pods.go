@@ -465,6 +465,9 @@ func (bnc *BaseNetworkController) addLogicalPortToNetwork(pod *corev1.Pod, nadKe
 	if err != nil {
 		return nil, nil, nil, false, fmt.Errorf("[%s] failed geting expected switch name when adding logical switch port: %v", podDesc, err)
 	}
+	
+	klog.Infof("DEBUG:addLogicalPortToNetwork: podDesc: %v", podDesc)
+	klog.Infof("DEBUG:addLogicalPortToNetwork: switchName: %v", switchName)
 
 	// it is possible to try to add a pod here that has no node. For example if a pod was deleted with
 	// a finalizer, and then the node was removed. In this case the pod will still exist in a running state.
