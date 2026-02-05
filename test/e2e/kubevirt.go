@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -83,6 +86,9 @@ func newControllerRuntimeClient(envVar string) (crclient.Client, error) {
 		return nil, err
 	}
 	scheme := runtime.NewScheme()
+	if err := storagev1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
 	if err := kubevirtv1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
@@ -342,6 +348,22 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			return nil
 		}
 
+		startEastWestHTTPBINTrafficWithClient = func(vclt *kubevirt.Client, vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
+			GinkgoHelper()
+			Expect(serverPodIPsByName).NotTo(BeEmpty())
+			polling := 15 * time.Second
+			for podName, serverPodIPs := range serverPodIPsByName {
+				for _, serverPodIP := range serverPodIPs {
+					output, err := vclt.RunCommand(vmi, fmt.Sprintf(`bash -ce 'echo ew-test; (while true; do n=$(ls /mnt); date; curl %[1]s/get?host=$n; sleep %[2]s; done) &> /tmp/%[3]s_%[1]s_httpbin.log &'`,
+						serverPodIP, "0.1", podName), polling)
+					if err != nil {
+						return fmt.Errorf("%s: %w", output, err)
+					}
+				}
+			}
+			return nil
+		}
+
 		startEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
 			return startEastWestIperfTrafficWithClient(virtClient, vmi, serverPodIPsByName, stage)
 		}
@@ -394,6 +416,27 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			cmd := `bash -ce 'echo "arp-monitor"; l="` + logPath + `"; while true; do date --rfc-3339=ns >> $l; ip n >> $l; sleep 0.1;  done &'`
 			o, err := vclt.RunCommand(vmi, cmd, 2*time.Second)
 			Expect(err).ToNot(HaveOccurred(), o)
+		}
+
+		checkEastWestHTTPBinTrafficWithClient = func(namespace, name, stage string) {
+			GinkgoHelper()
+			// Check the last line eventually show traffic flowing
+			Eventually(func() (string, error) {
+				log, err := e2ekubectl.RunKubectl(namespace, "logs", name, "--since="+strconv.Itoa(1)+"s")
+				if err != nil {
+					return "", err
+				}
+				Expect(log).NotTo(ContainSubstring("error"), stage+": "+log)
+				return log, nil
+			}).
+				WithPolling(100*time.Millisecond).
+				WithTimeout(2*time.Minute).
+				Should(
+					SatisfyAll(
+						ContainSubstring(`"status_code":"200"`),
+					),
+					stage+": failed checking httpbin traffic at file ",
+				)
 		}
 
 		checkEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, podIPsByName map[string][]string, stage string) {
@@ -1318,6 +1361,61 @@ fi
 					}
 					pod.Spec.Containers[0].Image = images.IPerf3()
 					pod.Spec.Containers[0].Args = []string{iperfServerScript() + "\n sleep infinity"}
+					for _, f := range opts {
+						f(pod)
+					}
+				})
+				if err != nil {
+					return nil, err
+				}
+				pods = append(pods, pod)
+			}
+			return pods, nil
+		}
+
+		createHTTPBinServerPods = func(nodes []corev1.Node, udnName string, role udnv1.NetworkRole, staticSubnets []string,
+			opts ...func(*corev1.Pod)) ([]*corev1.Pod, error) {
+			var pods []*corev1.Pod
+			for i, node := range nodes {
+				var nse *nadapi.NetworkSelectionElement
+				if role != udnv1.NetworkRolePrimary {
+					staticIPs, err := nextIPs(i, staticSubnets)
+					if err != nil {
+						return nil, err
+					}
+					nse = &nadapi.NetworkSelectionElement{
+						Name:      udnName,
+						IPRequest: staticIPs,
+					}
+				}
+				labels := map[string]string{"app": "httpbin"}
+				pod, err := createPod(fr, "testpod-httbin-"+sanitizeNodeName(node.Name), "", namespace, nil, labels, func(pod *corev1.Pod) {
+					if nse != nil {
+						pod.Annotations = networkSelectionElements(*nse)
+					}
+					pod.Spec.Containers[0].Name = "httpbin"
+					pod.Spec.Containers[0].Image = "localhost:5000/kennethreitz/httpbin"
+					pod.Spec.Containers[0].Command = []string{"/bin/bash", "-c"}
+					pod.Spec.Containers[0].Args = []string{`
+#!/bin/bash -xe
+cat <<EOF > ./c
+import datetime
+from gunicorn.glogging import Logger
+
+class CustomLogger(Logger):
+    def now(self):
+        return datetime.datetime.utcnow().isoformat(sep=' ', timespec='microseconds')
+
+logger_class = CustomLogger
+
+bind = '0.0.0.0:80'
+errorlog = '-'
+accesslog = '-'
+access_log_format = '{"ts":"%(t)s","host":"%({Host}i)s","remote":"%(h)s","status_code":"%(s)s","quary":"%({query_string}e)s"}'
+worker_class = 'gevent'
+EOF
+gunicorn -c ./c httpbin:app
+				`}
 					for _, f := range opts {
 						f(pod)
 					}
@@ -2503,6 +2601,10 @@ chpasswd: { expire: False }
 
 			serverArpMonitorContainerName = "arpmonitor"
 			arpMonitorOutputPath          = "/tmp/arp.log"
+
+			testNodeMountPVCName = "nodemeta"
+			testStorageClassName = "no-provisioner-storage-class"
+			testNodePath         = "/tmp/node"
 		)
 
 		var (
@@ -2578,6 +2680,32 @@ spec:
 
 			podsCIDRs = filterCIDRs(fr.ClientSet, podsCIDRv4Server, podsCIDRv6Server)
 			vmCIDRs = filterCIDRs(fr.ClientSet, vmiCIDRv4, vmiCIDRv6)
+
+			By("Creating StorageClass no-provisioner")
+			if err := crClient.Create(context.Background(), newTestSC(testStorageClassName)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test sc: " + err.Error())
+			}
+			if err := targetClusterClient.Create(context.Background(), newTestSC(testStorageClassName)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test sc on target: " + err.Error())
+			}
+			DeferCleanup(func() {
+				By("Deleting StorageClass no-provisioner")
+				crClient.Delete(context.Background(), &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+				By("Deleting StorageClass no-provisioner on target")
+				targetClusterClient.Delete(context.Background(), &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+			})
+			By("Creating PersistentVolume")
+			if err := crClient.Create(context.Background(), newTestPV(testNodeMountPVCName, testStorageClassName, testNodePath)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test pv: " + err.Error())
+			}
+			if err := targetClusterClient.Create(context.Background(), newTestPV(testNodeMountPVCName, testStorageClassName, testNodePath)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test pv on target: " + err.Error())
+			}
+			DeferCleanup(func() {
+				By("Deleting PersistentVolume")
+				crClient.Delete(context.Background(), &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+				targetClusterClient.Delete(context.Background(), &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+			})
 		})
 
 		BeforeEach(func() {
@@ -2611,12 +2739,41 @@ spec:
 			clientCreateCUDN(targetClusterClient, targetDynamicClient, cudnCopy)
 			cudnName = testCUDN.Name
 
+			By("Creating PersistentVolumeClaim")
+			if err := crClient.Create(context.Background(), newTestPVC(testNodeMountPVCName, namespace, testStorageClassName)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test pv: " + err.Error())
+			}
+			if err := targetClusterClient.Create(context.Background(), newTestPVC(testNodeMountPVCName, namespace, testStorageClassName)); err != nil && !apierrors.IsAlreadyExists(err) {
+				Fail("failed to create test pv on target: " + err.Error())
+			}
+			DeferCleanup(func() {
+				By("Deleting PersistentVolumeClaim")
+				crClient.Delete(context.Background(), &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+				targetClusterClient.Delete(context.Background(), &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: testNodeMountPVCName}})
+			})
+
 			By("Create test VM on source cluster")
 			networkData, err := newNetworkData(vmCIDRs)
 			Expect(err).NotTo(HaveOccurred())
 			netSrcCudn := kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: cudnName}}
-			vm := fedoraWithTestToolingVM(nil, nil, nil, netSrcCudn, "", networkData)
+			userData := `#cloud-config
+bootcmd:
+  - sudo mount -t virtiofs ` + testNodeMountPVCName + ` /mnt
+`
+			vm := fedoraWithTestToolingVM(nil, nil, nil, netSrcCudn, userData, networkData)
 			vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress = vmiMAC
+			vm.Spec.Template.Spec.Domain.Devices.Filesystems = append(vm.Spec.Template.Spec.Domain.Devices.Filesystems,
+				kubevirtv1.Filesystem{
+					Name:     testNodeMountPVCName,
+					Virtiofs: &kubevirtv1.FilesystemVirtiofs{},
+				},
+			)
+			vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes,
+				kubevirtv1.Volume{
+					Name:         testNodeMountPVCName,
+					VolumeSource: kubevirtv1.VolumeSource{PersistentVolumeClaim: &kubevirtv1.PersistentVolumeClaimVolumeSource{PersistentVolumeClaimVolumeSource: v1.PersistentVolumeClaimVolumeSource{ClaimName: testNodeMountPVCName}}},
+				},
+			)
 			createVirtualMachine(vm)
 			DeferCleanup(func() { deleteVirtualMachine(vm) })
 
@@ -2625,7 +2782,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(workerNodes.Items).NotTo(BeEmpty(), "no worker nodes found")
 			selectedNode := workerNodes.Items[rand.Intn(len(workerNodes.Items))]
-			testServerPods, err = createIperfServerPods([]corev1.Node{selectedNode}, cudnName, udnv1.NetworkRoleSecondary, podsCIDRs, func(p *corev1.Pod) {
+			testServerPods, err = createHTTPBinServerPods([]corev1.Node{selectedNode}, cudnName, udnv1.NetworkRoleSecondary, podsCIDRs, func(p *corev1.Pod) {
 				p.Spec.Affinity = newPodAntiAfinityRule(map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vm.Name})
 				p.ObjectMeta.Labels = map[string]string{"app": serverPodLabel}
 			})
@@ -2653,6 +2810,10 @@ spec:
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(p.Status.ContainerStatuses).ToNot(BeEmpty())
 				for _, s := range p.Status.ContainerStatuses {
+					if s.Name == "httpbin" {
+						g.Expect(s.State.Running).ToNot(BeNil())
+						g.Expect(s.State.Running.StartedAt).ToNot(BeZero())
+					}
 					if s.Name == serverSnifferContainerName {
 						g.Expect(s.State.Running).ToNot(BeNil())
 						g.Expect(s.State.Running.StartedAt).ToNot(BeZero())
@@ -2722,8 +2883,8 @@ spec:
 			cudnNetStatusKey := podNetworkStatusByNetConfigPredicate(namespace, cudnName, "secondary")
 			testPodsIPs := podsMultusNetworkIPs(testServerPods, cudnNetStatusKey)
 			Expect(testPodsIPs).NotTo(BeEmpty(), "no test pod IPs found")
-			Expect(startEastWestIperfTraffic(vmi, testPodsIPs, step)).To(Succeed(), step)
-			checkEastWestIperfTraffic(vmi, testPodsIPs, step)
+			Expect(startEastWestHTTPBINTrafficWithClient(virtClient, vmi, testPodsIPs, step)).To(Succeed(), step)
+			checkEastWestHTTPBinTrafficWithClient(namespace, testServerPods[0].ObjectMeta.Name, step)
 
 			by(vmi.Name, "Running live migration for virtual machine instance")
 			td(vmi)
@@ -2744,10 +2905,10 @@ spec:
 			}
 
 			step = by(vmi.Name, "Check east/west traffic after virtual machine instance live migration")
-			checkEastWestIperfTrafficWithClient(currentVirtClient, vmi, testPodsIPs, step)
+			checkEastWestHTTPBinTrafficWithClient(namespace, testServerPods[0].ObjectMeta.Name, step)
 
 			step = by(vmi.Name, "Stop server traffic")
-			output, err := currentVirtClient.RunCommand(vmi, "killall --wait iperf3", 5*time.Second)
+			output, err := currentVirtClient.RunCommand(vmi, `pgrep -f "ew-test" | xargs kill`, 5*time.Second)
 			Expect(err).ToNot(HaveOccurred(), step, output)
 
 			step = by(vmi.Name, "Stop vm arp monitoring")
@@ -2757,14 +2918,9 @@ spec:
 			logs := map[string]string{}
 			for _, pod := range testServerPods {
 				step := by(pod.Name, "Fetch server pods logs")
-				netStatus, err := podNetworkStatus(pod, cudnNetStatusKey)
+				logContent, err := e2ekubectl.RunKubectl(pod.Namespace, "logs", pod.Name)
 				Expect(err).ToNot(HaveOccurred(), step)
-				for _, ip := range netStatus[0].IPs {
-					logFile := fmt.Sprintf("/tmp/test_%s_iperf3.log", ip)
-					logContent, err := e2ekubectl.RunKubectl(pod.Namespace, "exec", pod.Name, "--", "cat", logFile)
-					Expect(err).ToNot(HaveOccurred())
-					logs[logFile] = logContent
-				}
+				logs[pod.Name] = logContent
 			}
 
 			By("Writing server logs")
@@ -2774,7 +2930,7 @@ spec:
 				Expect(os.WriteFile(serverLogsDir+"/"+fileName, []byte(content), 0o644)).To(Succeed())
 			}
 			By("Parse server logs")
-			results, err := parseIperfLogs(serverLogsDir, iperfIntervalSeconds, testMigrationScope, podIPv6Server)
+			results, err := parseHTTPBINLogs(serverLogsDir, testMigrationScope, podIPv6Server)
 			Expect(err).ToNot(HaveOccurred())
 			By("Writing test results")
 			resultsJSON, err := json.MarshalIndent(results, "", " ")
@@ -3406,6 +3562,65 @@ func parseIperfLogs(
 	return results, err
 }
 
+func parseHTTPBINLogs(
+	logsDir string,
+	migrationScope string,
+	ipV6Pattern string,
+) (
+	[]iperfResult,
+	error,
+) {
+	var results []iperfResult
+	err := filepath.WalkDir(logsDir, func(path string, d fs.DirEntry, err error) error {
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		var lines []string
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+		}
+		if scanner.Err() != nil {
+			return scanner.Err()
+		}
+		file.Close()
+		type LogLine struct {
+			Timestamp time.Time `json:"ts"`
+		}
+		var diffs []time.Duration
+		for i := 0; i < len(lines); i += 2 {
+			lineA := lines[i]
+			lineB := lines[i+1]
+			var logLineA *LogLine
+			if err := json.Unmarshal([]byte(lineA), logLineA); err != nil {
+				return fmt.Errorf("failed to unmarshal log line: %v\n%s", err, lineA)
+			}
+			var logLineB *LogLine
+			if err := json.Unmarshal([]byte(lineB), logLineB); err != nil {
+				return fmt.Errorf("failed to unmarshal log line: %v\n%s", err, lineB)
+			}
+			diff := logLineB.Timestamp.Sub(logLineA.Timestamp)
+			diffs = append(diffs, diff)
+		}
+		netDCSeconds := slices.Max(diffs).Seconds()
+		ipFamily := int64(4)
+		if strings.Contains(path, ipV6Pattern) {
+			ipFamily = 6
+		}
+		results = append(results, iperfResult{
+			Result:         netDCSeconds,
+			MigrationScope: migrationScope,
+			IpFamily:       ipFamily,
+			Log:            path,
+		})
+		return nil
+	})
+	return results, err
+}
+
 func countMatchesInFile(filename, pattern string) (int, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -3470,6 +3685,71 @@ func newPodAntiAfinityRule(labels map[string]string) *corev1.Affinity {
 						MatchExpressions: reqs,
 					},
 					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		},
+	}
+}
+
+func newTestSC(name string) *storagev1.StorageClass {
+	return &storagev1.StorageClass{
+		ObjectMeta:        metav1.ObjectMeta{Name: name},
+		Provisioner:       "kubernetes.io/no-provisioner",
+		ReclaimPolicy:     ptr.To(corev1.PersistentVolumeReclaimDelete),
+		VolumeBindingMode: ptr.To(storagev1.VolumeBindingWaitForFirstConsumer),
+	}
+}
+
+func newTestPV(name, scName, nodeTargetPath string) *corev1.PersistentVolume {
+	workerNodesSelector := corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{
+			{
+				Key:      "node-role.kubernetes.io/worker",
+				Operator: corev1.NodeSelectorOpExists,
+			},
+		},
+	}
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("5Mi"),
+			},
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteMany,
+			},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: nodeTargetPath,
+				},
+			},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              scName,
+			NodeAffinity: &corev1.VolumeNodeAffinity{
+				Required: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{workerNodesSelector},
+				},
+			},
+		},
+	}
+}
+
+func newTestPVC(name, namespace, scName string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteMany,
+			},
+			StorageClassName: ptr.To(scName),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Mi"),
 				},
 			},
 		},

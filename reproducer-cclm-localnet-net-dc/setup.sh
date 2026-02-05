@@ -145,6 +145,7 @@ cluster_up() {
     for c in ${clusters[@]}; do
       setup_migration_network $c
       wire_ovn_underlay_network $c
+      setup_nodes_metadata_files $c
     done
 
     echo "Creating migration network NAD on source cluster ($CLUSTER_SOURCE).."
@@ -251,6 +252,16 @@ cluster_down() {
     ovn_cluster_up $CLUSTER_SOURCE $CLUSTER_SOURCE_CFG --delete
     echo "Deleting target cluster ($CLUSTER_TARGET).."
     ovn_cluster_up $CLUSTER_TARGET $CLUSTER_TARGET_CFG --delete
+}
+
+setup_nodes_metadata_files() {
+  nodes=$(client $1 get no --no-headers -o custom-columns=:.metadata.name)
+  for n in $nodes; do 
+    $OCI_BIN exec $n mkdir /tmp/node
+    $OCI_BIN exec $n chcon -t container_file_t /tmp/node
+    $OCI_BIN exec $n touch /tmp/node/$n
+    $OCI_BIN exec $n ls -la /tmp/node
+  done 
 }
 
 client() { 
