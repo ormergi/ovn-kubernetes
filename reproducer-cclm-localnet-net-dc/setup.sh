@@ -167,7 +167,7 @@ ovn_cluster_up() {
   local -r name=$1
   local -r kubeconfig=$2
   shift 2
-  ./contrib/kind.sh -ep $OCI_BIN -lr -i6 -ds -ml 9 -nl 9 -cl "-vconsole:dbg" -mne -nse -ikv -cn "$name" -kc "$kubeconfig" "$@"
+  ./contrib/kind.sh -ep $OCI_BIN -lr -i6 -ds -ml 9 -nl 9 -cl "-vconsole:dbg" --isolated -mne -nse -ikv -cn "$name" -kc "$kubeconfig" "$@"
 }
 
 mirror_image_to_local_registry() {
