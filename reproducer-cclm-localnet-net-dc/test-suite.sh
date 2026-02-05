@@ -74,6 +74,8 @@ cleanup_before_test_suite(){
   set -e +x
 }
 
+underlay_iface_name=$($OCI_BIN network inspect underlay -f {{.NetworkInterface}})
+
 mirror_image_to_local_registry $VM_IMAGE
 mirror_image_to_local_registry $IPERF_IMAGE
 cleanup_before_test_suite
@@ -96,6 +98,7 @@ for r in $(seq $RUNS); do
     export TEST_REPORT_DIR="$dir"
     export FLAKE_ATTEMPTS=0
     export CONTAINER_RUNTIME=$OCI_BIN
+    export HOST_UNDERLAY_IFACE=$underlay_iface_name
     export IPERF3_IMAGE=$LOCAL_IPERF_IMAGE
     export PLATFORM_IPV4_SUPPORT=true
     export PLATFORM_IPV6_SUPPORT=true

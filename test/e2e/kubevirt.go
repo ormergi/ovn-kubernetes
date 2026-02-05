@@ -2542,6 +2542,8 @@ chpasswd: { expire: False }
 			podsCIDRs      []string
 
 			startTime time.Time
+
+			hostUnderlayInterface string
 		)
 
 		fr.SkipNamespaceCreation = true
@@ -2580,6 +2582,8 @@ spec:
 			Expect(targetClusterKubeConf).ToNot(BeEmpty(), "TARGET_CLUSTER_CONF env var unset")
 			rootTestReportDir = os.Getenv("TEST_REPORT_DIR")
 			Expect(rootTestReportDir).ToNot(BeEmpty(), "TEST_REPORT_DIR env var unset")
+			hostUnderlayInterface = os.Getenv("HOST_UNDERLAY_IFACE")
+			Expect(hostUnderlayInterface).ToNot(BeEmpty(), "HOST_UNDERLAY_IFACE env var unset")
 
 			targetClusterClientConfig, err := clientcmd.BuildConfigFromFlags("", targetClusterKubeConf)
 			Expect(err).ToNot(HaveOccurred())
@@ -2723,6 +2727,14 @@ spec:
 
 			By("Start ARP monitoring on VM")
 			startArpMonitoring(virtClient, vmi, arpMonitorOutputPath)
+
+			By("Start localnet underlay linux-bridge FDB monitoring on host")
+			monitorunderlayFDBcmd := `echo "fdb-monitor"; (while true; do date --rfc-3339=ns; brctl showmacs ` + hostUnderlayInterface + `; sleep 0.1; done) &> ` + testReportDir + `/underlay-br-fdb.log &`
+			res, err := exec.Command("bash", "-ce", monitorunderlayFDBcmd).CombinedOutput()
+			Expect(err).ToNot(HaveOccurred(), string(res))
+			DeferCleanup(func() {
+				exec.Command("bash", "-ce", `pgrep -f fdb-monitor | xargs kill`).CombinedOutput()
+			})
 
 			step := by(vmi.Name, "Check east/west traffic before virtual machine instance live migration")
 			cudnNetStatusKey := podNetworkStatusByNetConfigPredicate(namespace, cudnName, "secondary")
