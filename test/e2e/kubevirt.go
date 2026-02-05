@@ -388,6 +388,14 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				}
 			}
 		}
+
+		startArpMonitoring = func(vclt *kubevirt.Client, vmi *kubevirtv1.VirtualMachineInstance, logPath string) {
+			GinkgoHelper()
+			cmd := `bash -ce 'echo "arp-monitor"; l="` + logPath + `"; while true; do date --rfc-3339=ns >> $l; ip n >> $l; sleep 0.1;  done &'`
+			o, err := vclt.RunCommand(vmi, cmd, 2*time.Second)
+			Expect(err).ToNot(HaveOccurred(), o)
+		}
+
 		checkEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, podIPsByName map[string][]string, stage string) {
 			GinkgoHelper()
 			checkEastWestIperfTrafficWithClient(virtClient, vmi, podIPsByName, stage)
@@ -2492,6 +2500,9 @@ chpasswd: { expire: False }
 			sourceSnifferPodName       = "source-sniffer"
 			snifferOutputPath          = "/tmp/tshark.pcap"
 			snifferImage               = "localhost:5000/nicolaka/netshoot:v0.14"
+
+			serverArpMonitorContainerName = "arpmonitor"
+			arpMonitorOutputPath          = "/tmp/arp.log"
 		)
 
 		var (
@@ -2626,12 +2637,23 @@ spec:
 				"--image", snifferImage, "--profile=netadmin", "--", "tshark", "-i", "net1", "-w", snifferOutputPath,
 			)
 			Expect(err).NotTo(HaveOccurred(), "failed to start sniffer prob on server", o)
+			By("Start ARP monitoring on server pod")
+			c := fmt.Sprintf(`bash -ce 'echo "arp-monitor"; l="%s"; while true; do date --rfc-3339=ns >> $l; ip n >> $l; sleep 0.1; done & sleep 1000'`, arpMonitorOutputPath)
+			o, err = e2ekubectl.RunKubectl(namespace, "debug", testServerPods[0].Name, "-c", serverArpMonitorContainerName,
+				"--image", "localhost:5000/nicolaka/netshoot", "--profile=netadmin",
+				"--", "bash", "-ce", c,
+			)
+			Expect(err).NotTo(HaveOccurred(), "failed to start server arp-monitor container on server pod", o)
 			Eventually(func(g Gomega) {
 				p, err := fr.ClientSet.CoreV1().Pods(namespace).Get(context.Background(), testServerPods[0].Name, metav1.GetOptions{})
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(p.Status.ContainerStatuses).ToNot(BeEmpty())
 				for _, s := range p.Status.ContainerStatuses {
 					if s.Name == serverSnifferContainerName {
+						g.Expect(s.State.Running).ToNot(BeNil())
+						g.Expect(s.State.Running.StartedAt).ToNot(BeZero())
+					}
+					if s.Name == serverArpMonitorContainerName {
 						g.Expect(s.State.Running).ToNot(BeNil())
 						g.Expect(s.State.Running.StartedAt).ToNot(BeZero())
 					}
@@ -2681,6 +2703,9 @@ spec:
 			Expect(err).ToNot(HaveOccurred(), o)
 			Expect(e2epod.WaitTimeoutForPodReadyInNamespace(context.Background(), fr.ClientSet, sourceSnifferPodName, namespace, time.Minute)).To(Succeed())
 
+			By("Start ARP monitoring on VM")
+			startArpMonitoring(virtClient, vmi, arpMonitorOutputPath)
+
 			step := by(vmi.Name, "Check east/west traffic before virtual machine instance live migration")
 			cudnNetStatusKey := podNetworkStatusByNetConfigPredicate(namespace, cudnName, "secondary")
 			testPodsIPs := podsMultusNetworkIPs(testServerPods, cudnNetStatusKey)
@@ -2711,6 +2736,10 @@ spec:
 
 			step = by(vmi.Name, "Stop server traffic")
 			output, err := currentVirtClient.RunCommand(vmi, "killall --wait iperf3", 5*time.Second)
+			Expect(err).ToNot(HaveOccurred(), step, output)
+
+			step = by(vmi.Name, "Stop vm arp monitoring")
+			output, err = currentVirtClient.RunCommand(vmi, `pgrep -f "arp-monitor" | xargs kill`, 5*time.Second)
 			Expect(err).ToNot(HaveOccurred(), step, output)
 
 			logs := map[string]string{}
@@ -2779,6 +2808,31 @@ spec:
 			_, err = exec.Command("/usr/local/bin/kubectl", "cp", fmt.Sprintf("%s/%s:%s", namespace, targetSnifferPodName, snifferOutputPath), targetNodeSnifferOutput, "--kubeconfig", targetClusterKubeConf, "-n", namespace).CombinedOutput()
 			if err != nil {
 				fmt.Println(err)
+			}
+
+			By("Writing server arp monitoring log")
+			arpLog := testReportDir + "/server-arp.log"
+			_, err = e2ekubectl.RunKubectl(namespace, "cp", fmt.Sprintf("%s/%s:%s", namespace, testServerPods[0].Name, arpMonitorOutputPath), arpLog, "-c", serverArpMonitorContainerName)
+			if err != nil {
+				fmt.Println(err)
+			}
+			By("Writing VM arp monitoring log, from source cluster")
+			o, err := virtClient.RunCommand(vmi, "cat /tmp/arp.log", 2*time.Second)
+			if err != nil {
+				fmt.Println(err)
+			} else if len(o) > 0 {
+				if err := os.WriteFile(testReportDir+"/vm-arp--source.log", []byte(o), 0o644); err != nil {
+					fmt.Println(err)
+				}
+			}
+			By("Writing VM arp monitoring log, from target cluster")
+			o, err = targetClusterVirtClient.RunCommand(vmi, "cat /tmp/arp.log", 2*time.Second)
+			if err != nil {
+				fmt.Println(err)
+			} else if len(o) > 0 {
+				if err := os.WriteFile(testReportDir+"/vm-arp--target.log", []byte(o), 0o644); err != nil {
+					fmt.Println(err)
+				}
 			}
 
 			By("Dump test namespace object state from source cluster")
