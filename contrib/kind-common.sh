@@ -614,7 +614,16 @@ install_kubevirt() {
     if [ "$(kubectl get kubevirts -n kubevirt kubevirt -ojsonpath='{.status.phase}')" != "Deployed" ]; then
       local kubevirt_release_url=$(get_kubevirt_release_url "$KUBEVIRT_VERSION")
       echo "Deploying Kubevirt from $kubevirt_release_url"
-      kubectl apply -f "${kubevirt_release_url}/kubevirt-operator.yaml"
+      if [[ -n $KUBEVIRT_REGISTRY ]]; then
+        local -r kv_components=(operator api controller handler launcher synchronization-controller)
+        for kv_comp in "${kv_components[@]}"; do
+          mirror_image_to_local_registry "quay.io/kubevirt/virt-${kv_comp}:${KUBEVIRT_VERSION}" "${KUBEVIRT_REGISTRY}"
+        done
+        echo "Installing Kubevirt from registry: $KUBEVIRT_REGISTRY"
+        curl -L "${kubevirt_release_url}/kubevirt-operator.yaml" | sed "s?quay.io?${KUBEVIRT_REGISTRY}?g" | kubectl apply -f -
+      else
+        kubectl apply -f "${kubevirt_release_url}/kubevirt-operator.yaml"
+      fi
       kubectl apply -f "${kubevirt_release_url}/kubevirt-cr.yaml"
       if ! is_nested_virt_enabled; then
         kubectl -n kubevirt patch kubevirt kubevirt --type=merge --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
@@ -638,6 +647,14 @@ install_kubevirt() {
             kubectl logs --all-containers=true -n kubevirt $p || true
         done
     fi
+}
+
+mirror_image_to_local_registry() {
+  local -r image_tag="$1"
+  local -r target_registry="$2"
+  local -r repo_tag="${image_tag#*/}"
+  echo "Mirror image ($image_tag) to registry ($target_registry).."
+  skopeo copy "docker://${image_tag}" "docker://${target_registry}/${repo_tag}" --dest-tls-verify=false
 }
 
 install_cert_manager() {

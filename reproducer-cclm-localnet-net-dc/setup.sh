@@ -58,6 +58,10 @@ MIGRATION_IFACE="eth2"
 export OCI_BIN=${OCI_BIN:-podman}
 export KUBEVIRT_VERSION=${KUBEVIRT_VERSION:-"v1.7.0"}
 
+LOCAL_REGISTRY="localhost:5000"
+
+export KUBEVIRT_REGISTRY=${LOCAL_REGISTRY}
+
 ensure_prerequisites() {
   local -r rpms=(pip3 openssl wget virtctl)
   for r in "${rpms[@]}"; do
