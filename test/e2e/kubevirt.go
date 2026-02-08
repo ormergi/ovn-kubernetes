@@ -332,7 +332,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			polling := 15 * time.Second
 			for podName, serverPodIPs := range serverPodIPsByName {
 				for _, serverPodIP := range serverPodIPs {
-					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 -V -b %[4]s -i %.1[3]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
+					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -b %[4]s -i %.1[3]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
 						podName, serverPodIP, iperfIntervalSeconds, iperfBandwithStr), polling)
 					if err != nil {
 						return fmt.Errorf("%s: %w", output, err)
@@ -1243,12 +1243,12 @@ passwd:
 			iperfIntervalStr := fmt.Sprintf("%.1f", iperfIntervalSeconds)
 			return `
 #!/bin/bash -xe
-iface=$(ifconfig  |grep flags |grep -v "eth0\|lo" | sed "s/: .*//")
+iface=$(ifconfig  |grep "Link encap:" | grep -v "eth0\|lo" | sed "s/\s.*//")
 iface=${iface:-eth0}
 
-ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed "s#/.*##")
+ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed -e "s#/.*##" -e "s/addr://")
 if [ "$ipv4" != "" ]; then
-	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
+	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log --timestamps
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv4}_iperf3.log; then
 		cat /tmp/test_${ipv4}_iperf3.log
@@ -1258,12 +1258,12 @@ fi
 
 cnt=0
 while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
-	ipv6=$(ifconfig $iface | grep inet6 |grep -v fe80 |awk '{print $2}'| sed "s#/.*##")
+	ipv6=$(ifconfig $iface | grep inet6 |grep -v fe80 |awk '{print $3}'| sed "s#/.*##")
 	sleep 1
 	cnt=$((cnt+1))
 done
 if [ "$ipv6" != "" ]; then
-	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
+	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log --timestamps
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv6}_iperf3.log; then
 		cat /tmp/test_${ipv6}_iperf3.log 1>&2
