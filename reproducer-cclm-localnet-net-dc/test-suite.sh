@@ -39,8 +39,8 @@ CLUSTER_TARGET_KUBECONF="${HOME}/${CLUSTER_TARGET}.conf"
 LOCAL_REGISTRY="localhost:5000"
 
 VM_IMAGE="quay.io/kubevirtci/fedora-with-test-tooling:v20250416-e37573e"
-IPERF_IMAGE="quay.io/sronanrh/iperf:latest"
-LOCAL_IPERF_IMAGE="localhost:5000/sronanrh/iperf:latest"
+IPERF_IMAGE="docker.io/nicolaka/netshoot:v0.14"
+LOCAL_IPERF_IMAGE="localhost:5000/nicolaka/netshoot:v0.14"
 
 mirror_image_to_local_registry() {
   local -r image_tag="$1"
