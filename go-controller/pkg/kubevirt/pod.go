@@ -1,18 +1,20 @@
 package kubevirt
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
-	"sort"
 	"strings"
-
-	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
 
@@ -398,20 +400,6 @@ func IsPodAllowedForMigration(pod *corev1.Pod, netInfo util.NetInfo) bool {
 			netInfo.TopologyType() == ovntypes.LocalnetTopology)
 }
 
-func isTargetPodReady(targetPod *corev1.Pod) bool {
-	if targetPod == nil {
-		return false
-	}
-
-	// This annotation only appears on live migration scenarios, and it signals
-	// that target VM pod is ready to receive traffic, so we can route
-	// traffic to it.
-	targetReadyTimestamp := targetPod.Annotations[kubevirtv1.MigrationTargetReadyTimestamp]
-
-	// VM is ready to receive traffic
-	return targetReadyTimestamp != ""
-}
-
 func filterNotComplete(vmPods []*corev1.Pod) []*corev1.Pod {
 	var notCompletePods []*corev1.Pod
 	for _, vmPod := range vmPods {
@@ -445,6 +433,23 @@ const (
 	LiveMigrationFailed LiveMigrationState = "Failed"
 )
 
+// TODO: use only the nessary fileds instead of Pod objects, such as source and target pod names and node names.
+// Changing functions that use SourcePod and TargetPod to recive pod/node names instead of Pod objects.
+// Refrences:
+// - SourcePod:
+//   - addLogicalPortToNetworkForNAD
+//   	- isPodScheduledinLocalZone
+//   - setPodLogicalSwitchPortAddressesAndEnabledField
+// - TargetPod:
+//   - DiscoverLiveMigrationStatus
+//   - ReconcileIPv4AfterLiveMigration
+//   - ReconcileIPv6AfterLiveMigration
+//   - ensurePodForUserDefinedNetwork
+//   - addLogicalPortToNetworkForNAD
+//   - enableSourceLSPFailedLiveMigration
+//   - updateLocalPodEvent
+//   - reconcileLiveMigrationTargetZone
+
 // LiveMigrationStatus provides details about the current status of a live migration.
 // It includes information about the source and target pods as well as the migration state.
 type LiveMigrationStatus struct {
@@ -458,70 +463,118 @@ func (lm LiveMigrationStatus) IsTargetDomainReady() bool {
 	return lm.State == LiveMigrationTargetDomainReady
 }
 
+// getActiveVMIM finds a VirtualMachineInstanceMigration object
+// of the given VMI name, and return the first active migration object found.
+// It match VMIM objects according to the label kubevirt.io/vmi-name, matching the given VMIName.
+func getActiveVMIM(kubeClient kubernetes.Interface, ctx context.Context, namespace, vmiName string) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
+	vmimList := &kubevirtv1.VirtualMachineInstanceMigrationList{}
+	err := kubeClient.CoreV1().RESTClient().Get().
+		AbsPath("/apis/kubevirt.io/v1").
+		Namespace(namespace).
+		Resource("virtualmachineinstancemigrations").
+		Param("labelSelector", kubevirtv1.MigrationSelectorLabel+"="+vmiName).
+		Do(ctx).
+		Into(vmimList)
+	if err != nil {
+		return nil, err
+	}
+
+	// Kubevirt allow only one active VMIM object at a time.
+	// VMIM considered active when not completed; status.phase is NOT Succeeded or Failed
+	// We do want to handle failed migration, to ensure the migration source pod LSP is enabled.
+	for i, vmim := range vmimList.Items {
+		if vmim.Status.Phase != kubevirtv1.MigrationSucceeded {
+			return &vmimList.Items[i], nil
+		}
+	}
+
+	return nil, nil
+}
+
 // DiscoverLiveMigrationStatus determines the status of a live migration for a given pod.
-// It analyzes the state of pods associated with a VirtualMachine (VM) to identify whether
-// a live migration is in progress, the target domain is ready, or the migration has failed.
+// It looks for a VirtualMachineInstanceMigration object associated with the pod's VM
+// by matching the kubevirt.io/vmi-name label with the pod's vm.kubevirt.io/name label.
+// It analyzes the VMIM's Status.Phase to determine whether a live migration is in progress,
+// the target domain is ready, or the migration has failed.
 //
 // Note: The function assumes that the pod is part of a VirtualMachine resource managed
 // by KubeVirt.
-func DiscoverLiveMigrationStatus(client *factory.WatchFactory, pod *corev1.Pod) (*LiveMigrationStatus, error) {
+func DiscoverLiveMigrationStatus(kubeClient kubernetes.Interface, watchFactory *factory.WatchFactory, pod *corev1.Pod) (*LiveMigrationStatus, error) {
 	vmKey := ExtractVMNameFromPod(pod)
 	if vmKey == nil {
 		return nil, nil
 	}
 
-	vmPods, err := client.GetPodsBySelector(pod.Namespace, metav1.LabelSelector{MatchLabels: map[string]string{kubevirtv1.VirtualMachineNameLabel: vmKey.Name}})
+	vmim, err := getActiveVMIM(kubeClient, context.Background(), vmKey.Namespace, vmKey.Name)
+	if err != nil {
+		return nil, err
+	}
+	if vmim == nil {
+		return nil, nil
+	}
+
+	vmPods, err := watchFactory.GetPodsBySelector(vmKey.Namespace, metav1.LabelSelector{
+		MatchLabels: map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vmKey.Name},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// no migration
-	if len(vmPods) < 2 {
+	var state LiveMigrationState
+	switch {
+	case vmim.Status.Phase == kubevirtv1.MigrationScheduling:
+		klog.Infof("DEBUG: vmim phase is Sheduling, target node is not setteled yet - noop")
 		return nil, nil
+	case vmim.Status.Phase == kubevirtv1.MigrationScheduled:
+		klog.Infof("DEBUG: vmim phase is Scheduled, dump state:")
+		o, _ := json.MarshalIndent(vmim, "", " ")
+		klog.Info(string(o))
+		fallthrough
+	case vmim.IsRunning():
+		state = LiveMigrationInProgress
+	case vmim.Status.Phase == kubevirtv1.MigrationFailed:
+		state = LiveMigrationFailed
+	case vmim.Status.Phase == kubevirtv1.MigrationTargetReady:
+		state = LiveMigrationTargetDomainReady
+	default:
+		return nil, fmt.Errorf("unexpected live migration state: %s", vmim.Status.Phase)
 	}
 
-	// Sort vmPods by creation time
-	sort.Slice(vmPods, func(i, j int) bool {
-		return vmPods[j].CreationTimestamp.After(vmPods[i].CreationTimestamp.Time)
-	})
-
-	targetPod := vmPods[len(vmPods)-1]
-	livingPods := filterNotComplete(vmPods)
-
-	// If there is no living pod we should state no live migration status
-	if len(livingPods) == 0 {
-		return nil, nil
+	if vmim.Status.MigrationState == nil {
+		return nil, fmt.Errorf("migration phase is (%s) but migration state is nil: namespace(%s), pod(%s), vm(%s), vmim(%s)",
+			vmim.Status.Phase, pod.Namespace, pod.Name, vmKey.Name, vmim.Name)
+	}
+	if vmim.Status.MigrationState.SourceNode == "" {
+		return nil, fmt.Errorf("migrationState.sourceNode not found: namespace(%s), pod(%s), vm(%s), vmim(%s), vmimPhase(%s)",
+			pod.Namespace, pod.Name, vmKey.Name, vmim.Name, vmim.Status.Phase)
+	}
+	if vmim.Status.MigrationState.TargetNode == "" {
+		return nil, fmt.Errorf("migrationState.target node not found: namespace(%s), pod(%s), vm(%s), vmim(%s), vmimPhase(%s)",
+			pod.Namespace, pod.Name, vmKey.Name, vmim.Name, vmim.Status.Phase)
 	}
 
-	// There is a living pod but is not the target one so the migration
-	// has failed.
-	if util.PodCompleted(targetPod) {
-		return &LiveMigrationStatus{
-			SourcePod: livingPods[0],
-			TargetPod: targetPod,
-			State:     LiveMigrationFailed,
-		}, nil
+	var sourcePod, targetPod *corev1.Pod
+	for _, vmPod := range vmPods {
+		if vmPod.Spec.NodeName == vmim.Status.MigrationState.SourceNode {
+			sourcePod = vmPod
+		} else if vmPod.Spec.NodeName == vmim.Status.MigrationState.TargetNode {
+			targetPod = vmPod
+		}
+	}
+	if sourcePod == nil {
+		return nil, fmt.Errorf("migration source pod not found: namespace(%s), pod(%s), vm(%s), vmim(%s)",
+			pod.Namespace, pod.Name, vmKey.Name, vmim.Name)
+	}
+	if targetPod == nil {
+		return nil, fmt.Errorf("migration target pod not found: namespace(%s), pod(%s), vm(%s), vmim(%s)",
+			pod.Namespace, pod.Name, vmKey.Name, vmim.Name)
 	}
 
-	// no active migration
-	if len(livingPods) < 2 {
-		return nil, nil
-	}
-
-	if len(livingPods) > 2 {
-		return nil, tooManyPodsError(livingPods)
-	}
-
-	status := LiveMigrationStatus{
-		SourcePod: livingPods[0],
-		TargetPod: livingPods[1],
-		State:     LiveMigrationInProgress,
-	}
-
-	if isTargetPodReady(status.TargetPod) {
-		status.State = LiveMigrationTargetDomainReady
-	}
-	return &status, nil
+	return &LiveMigrationStatus{
+		SourcePod: sourcePod,
+		TargetPod: targetPod,
+		State:     state,
+	}, nil
 }
 
 // ReconcileIPv4AfterLiveMigration will send a GARP after live migration
@@ -530,6 +583,9 @@ func DiscoverLiveMigrationStatus(client *factory.WatchFactory, pod *corev1.Pod) 
 func (r *DefaultGatewayReconciler) ReconcileIPv4AfterLiveMigration(liveMigrationStatus *LiveMigrationStatus) error {
 	if liveMigrationStatus.State != LiveMigrationTargetDomainReady {
 		return nil
+	}
+	if liveMigrationStatus.TargetPod == nil {
+		return fmt.Errorf("target pod not found for live migration")
 	}
 	var gwMAC net.HardwareAddr
 	if !config.Layer2UsesTransitRouter {
@@ -574,12 +630,17 @@ func (r *DefaultGatewayReconciler) ReconcileIPv6AfterLiveMigration(liveMigration
 	if !liveMigration.IsTargetDomainReady() {
 		return nil
 	}
+	if liveMigration.TargetPod == nil {
+		return fmt.Errorf("target pod not found for live migration")
+	}
+	targetPod := liveMigration.TargetPod
+	targetNodeName := targetPod.Spec.NodeName
+
 	nodes, err := r.watchFactory.GetNodes()
 	if err != nil {
 		return err
 	}
 
-	targetPod := liveMigration.TargetPod
 	nadKeys, err := util.PodNADKeys(targetPod, r.netInfo, r.getNetworkNameForNADKey)
 	if err != nil {
 		return err
@@ -601,7 +662,7 @@ func (r *DefaultGatewayReconciler) ReconcileIPv6AfterLiveMigration(liveMigration
 
 	ras := make([]ndp.RouterAdvertisement, 0, len(nodes))
 	for _, node := range nodes {
-		if !config.Layer2UsesTransitRouter && node.Name == liveMigration.TargetPod.Spec.NodeName {
+		if !config.Layer2UsesTransitRouter && node.Name == targetNodeName {
 			// skip the target node since this is the proper gateway
 			continue
 		}
@@ -618,9 +679,9 @@ func (r *DefaultGatewayReconciler) ReconcileIPv6AfterLiveMigration(liveMigration
 		ras = append(ras, newRouterAdvertisementFromIPAndLifetime(nodeJoinAddrs[0].IP, destinationMAC, destinationIP.IP, 0))
 	}
 	if !config.Layer2UsesTransitRouter {
-		targetNode, err := r.watchFactory.GetNode(liveMigration.TargetPod.Spec.NodeName)
+		targetNode, err := r.watchFactory.GetNode(targetNodeName)
 		if err != nil {
-			return fmt.Errorf("failed fetching node %q to reconcile ipv6 gateway: %w", liveMigration.TargetPod.Spec.NodeName, err)
+			return fmt.Errorf("failed fetching node %q to reconcile ipv6 gateway: %w", targetNodeName, err)
 		}
 		targetNodeJoinAddrs, err := udn.GetGWRouterIPs(targetNode, r.netInfo)
 		if err != nil {

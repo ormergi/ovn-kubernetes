@@ -217,6 +217,11 @@ rules:
           - dnsnameresolvers
       verbs: [ "get", "list", "watch" ]
     {%- endif %}
+    - apiGroups: ["kubevirt.io"]
+      resources:
+          - virtualmachineinstance
+          - virtualmachineinstancemigrations
+      verbs: ["list", "get", "watch"]
 
 # Without IC endpoints are read by ovnkube-node on startup
 # With IC endpoints are created by ovnkube-zone-controller/sb-ovsdb startup script in multinode-zone for IC
