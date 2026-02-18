@@ -657,16 +657,50 @@ mirror_image_to_local_registry() {
   skopeo copy "docker://${image_tag}" "docker://${target_registry}/${repo_tag}" --dest-tls-verify=false
 }
 
+mirror_manifest_images(){
+  local opt="${opt:-${3:-}}"
+  local images=($(curl -sL $1 | grep -Po "image:\s\K.*" | tr -d '"' | sed -e "$opt" ))
+  for i in ${images[@]}; do 
+    mirror_image_to_local_registry "$i" "$2"
+  done
+}
+
+apply_manifest_with_local_registry() {
+  local opt="${opt:-${3:-}}"
+  curl -sL $1 |\
+    # replace the image tag regisgry with value given by $2
+    sed -e "s|^\([[:space:]]*image:[[:space:]]*\)\([\"'\'']\)\?[^/]\+|\1\2$2|" -e "$opt" |\
+    run_kubectl apply -f -
+}
+
 install_cert_manager() {
   local cert_manager_version="v1.14.4"
   echo "Installing cert-manager ..."
   manifest="https://github.com/cert-manager/cert-manager/releases/download/${cert_manager_version}/cert-manager.yaml"
+  
+  if [ -n "$KIND_LOCAL_REGISTRY" ]; then
+    mirror_manifest_images "$manifest" "localhost:5000"
+    apply_manifest_with_local_registry "$manifest" "localhost:5000"
+    kubectl wait -n cert-manager deployment cert-manager --for condition=Available --timeout 5m
+    kubectl wait -n cert-manager deployment cert-manager-cainjector --for condition=Available --timeout 5m
+    kubectl wait -n cert-manager deployment cert-manager-webhook --for condition=Available --timeout 5m
+    return 
+  fi
+
   run_kubectl apply -f "$manifest"
 }
 
 install_kubevirt_ipam_controller() {
   echo "Installing KubeVirt IPAM controller manager ..."
   manifest="https://github.com/kubevirt/ipam-extensions/releases/download/v0.3.1/install.yaml"
+  
+  if [ -n "$KIND_LOCAL_REGISTRY" ]; then
+      mirror_manifest_images "$manifest" "localhost:5000"
+      apply_manifest_with_local_registry "$manifest" "localhost:5000"
+      kubectl wait -n kubevirt-ipam-controller-system deployment kubevirt-ipam-controller-manager --for condition=Available --timeout 5m
+      return 
+  fi
+  
   run_kubectl apply -f "$manifest"
   kubectl wait -n kubevirt-ipam-controller-system deployment kubevirt-ipam-controller-manager --for condition=Available --timeout 5m
 }
@@ -674,6 +708,14 @@ install_kubevirt_ipam_controller() {
 install_multus() {
   local version="v4.1.3"
   echo "Installing multus-cni $version daemonset ..."
+  
+  if [ -n "$KIND_LOCAL_REGISTRY" ]; then
+      local -r m="https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/${version}/deployments/multus-daemonset.yml"
+      mirror_manifest_images "$m" "localhost:5000" "s|multus-cni:snapshot|multus-cni:${version}|g"
+      apply_manifest_with_local_registry "$m" "localhost:5000" "s|multus-cni:snapshot|multus-cni:${version}|g"
+      return 
+  fi
+
   wget -qO- "https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/${version}/deployments/multus-daemonset.yml" |\
     sed -e "s|multus-cni:snapshot|multus-cni:${version}|g" |\
     run_kubectl apply -f -
