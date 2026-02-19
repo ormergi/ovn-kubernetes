@@ -201,7 +201,7 @@ func newKubevirtPod(phase corev1.PodPhase, annotations map[string]string, creati
 			Name:              "virt-launcher-" + vmName + rand.String(5),
 			Namespace:         corev1.NamespaceDefault,
 			Annotations:       annotations,
-			Labels:            map[string]string{kubevirtv1.VirtualMachineNameLabel: vmName},
+			Labels:            map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vmName},
 			CreationTimestamp: metav1.Time{Time: time.Now().Add(creationOffset)},
 		},
 		Spec: corev1.PodSpec{},

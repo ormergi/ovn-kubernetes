@@ -22,7 +22,7 @@ import (
 // Returns "<ns>/<pod-name>" for regular pods and "<ns>/<vm-name>" for VMs.
 func macOwner(pod *corev1.Pod) string {
 	// Check if this is a VM pod and persistent IPs are enabled
-	if vmName, ok := pod.Labels[kubevirtv1.VirtualMachineNameLabel]; ok {
+	if vmName, ok := pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel]; ok {
 		return fmt.Sprintf("%s/%s", pod.Namespace, vmName)
 	}
 

@@ -68,11 +68,11 @@ func findVMRelatedPods(client *factory.WatchFactory, pod *corev1.Pod) ([]*corev1
 }
 
 func findVMRelatedPodsWithListerFn(listPodsFn listPodsFn, pod *corev1.Pod) ([]*corev1.Pod, error) {
-	vmName, ok := pod.Labels[kubevirtv1.VirtualMachineNameLabel]
+	vmName, ok := pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel]
 	if !ok {
 		return nil, nil
 	}
-	vmLabelSelector := metav1.LabelSelector{MatchLabels: map[string]string{kubevirtv1.VirtualMachineNameLabel: vmName}}
+	vmLabelSelector := metav1.LabelSelector{MatchLabels: map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vmName}}
 	vmPods, err := listPodsFn(pod.Namespace, vmLabelSelector)
 	if err != nil {
 		return nil, err
@@ -243,7 +243,7 @@ func nodeContainsPodSubnet(watchFactory *factory.WatchFactory, nodeName string, 
 // ExtractVMNameFromPod returns namespace and name of vm backed up but the pod
 // for regular pods return nil
 func ExtractVMNameFromPod(pod *corev1.Pod) *ktypes.NamespacedName {
-	vmName, ok := pod.Labels[kubevirtv1.VirtualMachineNameLabel]
+	vmName, ok := pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel]
 	if !ok {
 		return nil
 	}
@@ -302,7 +302,7 @@ func FindLiveMigratablePods(watchFactory *factory.WatchFactory) ([]*corev1.Pod, 
 	vmPods, err := watchFactory.GetAllPodsBySelector(
 		metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{{
-				Key:      kubevirtv1.VirtualMachineNameLabel,
+				Key:      kubevirtv1.DeprecatedVirtualMachineNameLabel,
 				Operator: metav1.LabelSelectorOpExists,
 			}},
 		},

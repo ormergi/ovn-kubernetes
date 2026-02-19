@@ -136,7 +136,7 @@ func EnsureLocalZonePodAddressesToNodeRoute(watchFactory *factory.WatchFactory, 
 				Priority: types.EgressLiveMigrationReroutePriority,
 				ExternalIDs: map[string]string{
 					OvnZoneExternalIDKey:         OvnLocalZone,
-					VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.VirtualMachineNameLabel],
+					VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel],
 					NamespaceExternalIDsKey:      pod.Namespace,
 				},
 			}
@@ -156,7 +156,7 @@ func EnsureLocalZonePodAddressesToNodeRoute(watchFactory *factory.WatchFactory, 
 			OutputPort: &outputPort,
 			ExternalIDs: map[string]string{
 				OvnZoneExternalIDKey:         OvnLocalZone,
-				VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.VirtualMachineNameLabel],
+				VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel],
 				NamespaceExternalIDsKey:      pod.Namespace,
 			},
 		}
@@ -233,7 +233,7 @@ func EnsureRemoteZonePodAddressesToNodeRoute(watchFactory *factory.WatchFactory,
 			Policy:   &nbdb.LogicalRouterStaticRoutePolicyDstIP,
 			ExternalIDs: map[string]string{
 				OvnZoneExternalIDKey:         OvnRemoteZone,
-				VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.VirtualMachineNameLabel],
+				VirtualMachineExternalIDsKey: pod.Labels[kubevirtv1.DeprecatedVirtualMachineNameLabel],
 				NamespaceExternalIDsKey:      pod.Namespace,
 			},
 		}
