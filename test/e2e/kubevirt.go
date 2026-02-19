@@ -928,8 +928,10 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				Spec: kubevirtv1.VirtualMachineInstanceSpec{
 					NodeSelector: nodeSelector,
 					Domain: kubevirtv1.DomainSpec{
-						Memory: &kubevirtv1.Memory{
-							Guest: ptr.To(resource.MustParse("2048Mi")),
+						Resources: kubevirtv1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceMemory: resource.MustParse("1024Mi"),
+							},
 						},
 						Devices: kubevirtv1.Devices{
 							Disks: []kubevirtv1.Disk{
