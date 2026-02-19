@@ -324,27 +324,20 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			}
 		}
 
-		iperfIntervalSeconds = 1.0
-		iperfBandwithStr     = "11M"
-
-		startEastWestIperfTrafficWithClient = func(vclt *kubevirt.Client, vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
+		startEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
 			GinkgoHelper()
 			Expect(serverPodIPsByName).NotTo(BeEmpty())
 			polling := 15 * time.Second
 			for podName, serverPodIPs := range serverPodIPsByName {
 				for _, serverPodIP := range serverPodIPs {
-					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -b %[4]s -i %.1[3]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
-						podName, serverPodIP, iperfIntervalSeconds, iperfBandwithStr), polling)
+					output, err := virtClient.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
+						podName, serverPodIP), polling)
 					if err != nil {
 						return fmt.Errorf("%s: %w", output, err)
 					}
 				}
 			}
 			return nil
-		}
-
-		startEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
-			return startEastWestIperfTrafficWithClient(virtClient, vmi, serverPodIPsByName, stage)
 		}
 
 		checkIperfTraffic = func(iperfLogFile string, execFn func(cmd string) (string, error), stage string) {
@@ -1240,16 +1233,14 @@ passwd:
 			return pods
 		}
 
-		iperfServerScript = func() string {
-			iperfIntervalStr := fmt.Sprintf("%.1f", iperfIntervalSeconds)
-			return `
+		iperfServerScript = `
 #!/bin/bash -xe
 iface=$(ifconfig  |grep "Link encap:" | grep -v "eth0\|lo" | sed "s/\s.*//")
 iface=${iface:-eth0}
 
 ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed -e "s#/.*##" -e "s/addr://")
 if [ "$ipv4" != "" ]; then
-	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log --timestamps
+	iperf3 -V -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv4}_iperf3.log; then
 		cat /tmp/test_${ipv4}_iperf3.log
@@ -1264,7 +1255,7 @@ while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
 	cnt=$((cnt+1))
 done
 if [ "$ipv6" != "" ]; then
-	iperf3 -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log --timestamps
+	iperf3 -V -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv6}_iperf3.log; then
 		cat /tmp/test_${ipv6}_iperf3.log 1>&2
@@ -1272,8 +1263,6 @@ if [ "$ipv6" != "" ]; then
 	fi
 fi
 `
-		}
-
 		nextIPs = func(idx int, subnets []string) ([]string, error) {
 			var ips []string
 			for _, subnet := range subnets {
@@ -1310,7 +1299,7 @@ fi
 						pod.Annotations = networkSelectionElements(*nse)
 					}
 					pod.Spec.Containers[0].Image = images.IPerf3()
-					pod.Spec.Containers[0].Args = []string{iperfServerScript() + "\n sleep infinity"}
+					pod.Spec.Containers[0].Args = []string{iperfServerScript + "\n sleep infinity"}
 					for _, f := range opts {
 						f(pod)
 					}
@@ -1709,7 +1698,7 @@ write_files:
     encoding: b64
     content: %s
     permissions: '0755'
-`, base64.StdEncoding.EncodeToString([]byte(iperfServerScript())))
+`, base64.StdEncoding.EncodeToString([]byte(iperfServerScript)))
 
 			virtualMachine = resourceCommand{
 				description: "VirtualMachine",
@@ -2010,7 +1999,7 @@ ip route add %[3]s via %[4]s
 				checkNorthSouthIngressIperfTraffic(externalContainer, serverIPs, serverPort, step)
 				checkNorthSouthEgressICMPTraffic(vmi, externalContainerIPs, step)
 				if td.ingress == "routed" {
-					_, err := infraprovider.Get().ExecExternalContainerCommand(externalContainer, []string{"bash", "-c", iperfServerScript()})
+					_, err := infraprovider.Get().ExecExternalContainerCommand(externalContainer, []string{"bash", "-c", iperfServerScript})
 					Expect(err).NotTo(HaveOccurred(), step)
 					Expect(startNorthSouthEgressIperfTraffic(vmi, externalContainerIPs, iperf3DefaultPort, step)).To(Succeed())
 					By("Check egress src ip is not node IP on 'routed' ingress mode")
@@ -2486,13 +2475,6 @@ chpasswd: { expire: False }
 			localMigrationScope        = "cluster-local"
 
 			serverPodLabel = "test-server"
-
-			serverSnifferContainerName = "sniffer"
-			snifferPodLabel            = serverSnifferContainerName
-			targetSnifferPodName       = "target-sniffer"
-			sourceSnifferPodName       = "source-sniffer"
-			snifferOutputPath          = "/tmp/tshark.pcap"
-			snifferImage               = "localhost:5000/nicolaka/netshoot:v0.14"
 		)
 
 		var (
@@ -2519,31 +2501,6 @@ chpasswd: { expire: False }
 		)
 
 		fr.SkipNamespaceCreation = true
-
-		newSnifferPod := func(name, node string) string {
-			return `
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ` + name + `
-  labels:
-    app: sniffer
-spec:
-  containers:
-  - args: ["tshark", "-i", "eth1", "-w", "` + snifferOutputPath + `"]
-    image: ` + snifferImage + `
-    imagePullPolicy: IfNotPresent
-    name: sniffer
-    resources: {}
-    securityContext:
-      privileged: true
-  enableServiceLinks: true
-  hostNetwork: true
-  nodeName: ` + node + `
-  restartPolicy: Never
-  terminationGracePeriodSeconds: 0		
-`
-		}
 
 		BeforeAll(func() {
 			sourceClusterKubeConf = os.Getenv("KUBECONFIG")
@@ -2626,23 +2583,6 @@ spec:
 				}
 			})
 
-			By("Start sniffer prob on server pod")
-			o, err := e2ekubectl.RunKubectl(namespace, "debug", testServerPods[0].Name, "-c", serverSnifferContainerName,
-				"--image", snifferImage, "--profile=netadmin", "--", "tshark", "-i", "net1", "-w", snifferOutputPath,
-			)
-			Expect(err).NotTo(HaveOccurred(), "failed to start sniffer prob on server", o)
-			Eventually(func(g Gomega) {
-				p, err := fr.ClientSet.CoreV1().Pods(namespace).Get(context.Background(), testServerPods[0].Name, metav1.GetOptions{})
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(p.Status.ContainerStatuses).ToNot(BeEmpty())
-				for _, s := range p.Status.ContainerStatuses {
-					if s.Name == serverSnifferContainerName {
-						g.Expect(s.State.Running).ToNot(BeNil())
-						g.Expect(s.State.Running.StartedAt).ToNot(BeZero())
-					}
-				}
-			}).WithTimeout(time.Minute * 5).WithPolling(time.Second).Should(Succeed())
-
 			step := by(vm.Name, "Wait for VM readiness")
 			vmi = &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: vm.Name}}
 			waitVirtualMachineInstanceReadinessWith(vmi, kubevirtv1.VirtualMachineInstanceAgentConnected, corev1.ConditionTrue)
@@ -2656,35 +2596,12 @@ spec:
 
 		var ccliveMigrateSucceed = func(vmi *kubevirtv1.VirtualMachineInstance) {
 			ccLiveMigrateVirtualMachine(crClient, targetClusterClient, namespace, vmi.Name)
-
-			By("Wait for migration target pod spawn")
-			var targetNode string
-			Eventually(func(g Gomega) {
-				pods, err := targetClusterClientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-					LabelSelector: "vm.kubevirt.io/name=" + vmi.Name})
-				g.Expect(err).ToNot(HaveOccurred())
-				g.Expect(len(pods.Items)).To(BeNumerically("==", 1))
-				targetNode = pods.Items[0].Spec.NodeName
-			}).WithPolling(100 * time.Millisecond).WithTimeout(time.Minute * 5).Should(Succeed())
-			By("Start sniffer prob on target cluster node")
-			o, err := cluster_context.ExecOutput(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() (string, error) {
-				return e2ekubectl.RunKubectlInput(namespace, newSnifferPod(targetSnifferPodName, targetNode), "apply", "-f", "-")
-			})
-			Expect(err).ToNot(HaveOccurred(), "failed to run sniffer at target cluster node", o)
-			Expect(e2epod.WaitForPodRunningInNamespace(context.Background(), targetClusterClientset, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: targetSnifferPodName, Namespace: namespace}})).To(Succeed())
-
 			checkCCLiveMigrationSucceeded(crClient, targetClusterClient, namespace, vmi.Name)
 		}
 
 		DescribeTable("should maintain tcp connection with minimal downtime", func(testMigrationScope string, td func(vmi *kubevirtv1.VirtualMachineInstance)) {
 			testReportDir = rootTestReportDir + "/" + testMigrationScope
 			Expect(os.MkdirAll(testReportDir, 0o755)).To(Succeed())
-
-			By("Start sniffer prob on source node")
-			sourceNode := vmi.Status.NodeName
-			o, err := e2ekubectl.RunKubectlInput(namespace, newSnifferPod(sourceSnifferPodName, sourceNode), "apply", "-f", "-")
-			Expect(err).ToNot(HaveOccurred(), o)
-			Expect(e2epod.WaitTimeoutForPodReadyInNamespace(context.Background(), fr.ClientSet, sourceSnifferPodName, namespace, time.Minute)).To(Succeed())
 
 			By("Start localnet underlay FDB monitoring on host")
 			monitorunderlayFDBcmd := `echo "fdb-monitor" && (while true; do date --rfc-3339=ns; brctl showmacs ` + hostUnderlayInterface + `; sleep 0.1; done) &> ` + testReportDir + `/underlay-br-fdb.log &`
@@ -2747,7 +2664,7 @@ spec:
 				Expect(os.WriteFile(serverLogsDir+"/"+fileName, []byte(content), 0o644)).To(Succeed())
 			}
 			By("Parse server logs")
-			results, err := parseHTTPBINLogs(serverLogsDir, testMigrationScope, podIPv6Server)
+			results, err := parseIperfLogs(serverLogsDir, 1, testMigrationScope, podIPv6Server)
 			Expect(err).ToNot(HaveOccurred())
 			By("Writing test results")
 			resultsJSON, err := json.MarshalIndent(results, "", " ")
@@ -2775,26 +2692,6 @@ spec:
 			if err := os.WriteFile(testReportDir+"/"+r, []byte(r), 0o644); err != nil {
 				fmt.Println(err)
 			}
-
-			By("Writing server sniffer output")
-			serverSnifferOutput := testReportDir + "/server.pcap"
-			_, err := e2ekubectl.RunKubectl(namespace, "cp", fmt.Sprintf("%s/%s:%s", namespace, testServerPods[0].Name, snifferOutputPath), serverSnifferOutput, "-c", serverSnifferContainerName)
-			if err != nil {
-				fmt.Println(err)
-			}
-			By("Writing source node sniffer output")
-			sourceNodeSnifferOutput := testReportDir + "/source-node.pcap"
-			_, err = e2ekubectl.RunKubectl(namespace, "cp", fmt.Sprintf("%s/%s:%s", namespace, sourceSnifferPodName, snifferOutputPath), sourceNodeSnifferOutput)
-			if err != nil {
-				fmt.Println(err)
-			}
-			By("Writing target node sniffer output")
-			targetNodeSnifferOutput := testReportDir + "/target-node.pcap"
-			_, err = exec.Command("/usr/local/bin/kubectl", "cp", fmt.Sprintf("%s/%s:%s", namespace, targetSnifferPodName, snifferOutputPath), targetNodeSnifferOutput, "--kubeconfig", targetClusterKubeConf, "-n", namespace).CombinedOutput()
-			if err != nil {
-				fmt.Println(err)
-			}
-
 			By("Dump test namespace object state from source cluster")
 			types := []string{"vms", "vmis", "vmims", "pods"}
 			dir := fmt.Sprintf("%s/source/%s", testReportDir, namespace)
