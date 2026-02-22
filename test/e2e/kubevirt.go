@@ -324,14 +324,15 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			}
 		}
 
+		iperfIntervalSeconds      = 0.1
 		startEastWestIperfTraffic = func(vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
 			GinkgoHelper()
 			Expect(serverPodIPsByName).NotTo(BeEmpty())
 			polling := 15 * time.Second
 			for podName, serverPodIPs := range serverPodIPsByName {
 				for _, serverPodIP := range serverPodIPs {
-					output, err := virtClient.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
-						podName, serverPodIP), polling)
+					output, err := virtClient.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -R -i %.1[3]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
+						podName, serverPodIP, iperfIntervalSeconds), polling)
 					if err != nil {
 						return fmt.Errorf("%s: %w", output, err)
 					}
@@ -340,31 +341,34 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			return nil
 		}
 
+		iperfLinesToCheck = int(1 / iperfIntervalSeconds)
+
 		checkIperfTraffic = func(iperfLogFile string, execFn func(cmd string) (string, error), stage string) {
 			GinkgoHelper()
-			// Check the last line eventually show traffic flowing
-			Eventually(func() (string, error) {
+			Eventually(func() ([]string, error) {
 				iperfLog, err := execFn("cat " + iperfLogFile)
 				if err != nil {
-					return "", err
+					return nil, err
 				}
-				// Fail fast
 				Expect(iperfLog).NotTo(ContainSubstring("iperf3: error"), stage+": "+iperfLogFile)
-				// Remove last carriage return to properly split by new line.
 				iperfLog = strings.TrimSuffix(iperfLog, "\n")
 				iperfLogLines := strings.Split(iperfLog, "\n")
 				if len(iperfLogLines) == 0 {
-					return "", nil
+					return nil, nil
 				}
-				lastIperfLogLine := iperfLogLines[len(iperfLogLines)-1]
-				return lastIperfLogLine, nil
+				startIdx := len(iperfLogLines) - iperfLinesToCheck
+				if startIdx < 0 {
+					startIdx = 0
+				}
+				return iperfLogLines[startIdx:], nil
 			}).
-				WithPolling(50*time.Millisecond).
-				WithTimeout(2*time.Minute).
+				WithPolling(1*time.Second).
+				WithTimeout(3*time.Minute).
 				Should(
 					SatisfyAll(
-						ContainSubstring(" sec "),
-						Not(ContainSubstring("0.00 Bytes  0.00 bits/sec")),
+						HaveLen(iperfLinesToCheck),
+						ContainElement(ContainSubstring("sec")),
+						Not(ContainElement(ContainSubstring("0.00 Bytes  0.00 bits/sec"))),
 					),
 					stage+": failed checking iperf3 traffic at file "+iperfLogFile,
 				)
@@ -1234,7 +1238,7 @@ passwd:
 			}
 			return pods
 		}
-
+		iperfIntervalStr  = fmt.Sprintf("%.1f", iperfIntervalSeconds)
 		iperfServerScript = `
 #!/bin/bash -xe
 iface=$(ifconfig  |grep "Link encap:" | grep -v "eth0\|lo" | sed "s/\s.*//")
@@ -1242,7 +1246,7 @@ iface=${iface:-eth0}
 
 ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed -e "s#/.*##" -e "s/addr://")
 if [ "$ipv4" != "" ]; then
-	iperf3 -V -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
+	iperf3 --timestamps -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv4}_iperf3.log; then
 		cat /tmp/test_${ipv4}_iperf3.log
@@ -1257,7 +1261,7 @@ while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
 	cnt=$((cnt+1))
 done
 if [ "$ipv6" != "" ]; then
-	iperf3 -V -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
+	iperf3 --timestamps -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv6}_iperf3.log; then
 		cat /tmp/test_${ipv6}_iperf3.log 1>&2
@@ -2530,13 +2534,17 @@ chpasswd: { expire: False }
 		})
 
 		BeforeEach(func() {
+			c := `bridge fdb flush dev ` + hostUnderlayInterface
+			res, err := exec.Command("bash", "-ce", c).CombinedOutput()
+			Expect(err).ToNot(HaveOccurred(), string(res))
+
 			startTime = time.Now()
 			By("Setup underlay network on source cluster")
 			Expect(providerCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
 			By("Setup underlay network on target cluster")
 			// SetupUnderlay relays on env clients the e2e test suite detect, which is the source cluster client.
 			// switch e2e test suite clients to use target cluster clients and setup underlay network on target cluster.
-			err := cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
+			err = cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
 				return providerCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})
 			})
 			Expect(err).ToNot(HaveOccurred())
@@ -2606,7 +2614,7 @@ chpasswd: { expire: False }
 			Expect(os.MkdirAll(testReportDir, 0o755)).To(Succeed())
 
 			By("Start localnet underlay FDB monitoring on host")
-			monitorunderlayFDBcmd := `echo "fdb-monitor" && (while true; do date --rfc-3339=ns; brctl showmacs ` + hostUnderlayInterface + `; sleep 0.1; done) &> ` + testReportDir + `/underlay-br-fdb.log &`
+			monitorunderlayFDBcmd := `echo "fdb-monitor"; (while true; do date --rfc-3339=ns; brctl showmacs ` + hostUnderlayInterface + `; sleep 0.1; done) &> ` + testReportDir + `/underlay-br-fdb.log &`
 			res, err := exec.Command("bash", "-ce", monitorunderlayFDBcmd).CombinedOutput()
 			Expect(err).ToNot(HaveOccurred(), string(res))
 			DeferCleanup(func() {
@@ -2666,7 +2674,7 @@ chpasswd: { expire: False }
 				Expect(os.WriteFile(serverLogsDir+"/"+fileName, []byte(content), 0o644)).To(Succeed())
 			}
 			By("Parse server logs")
-			results, err := parseIperfLogs(serverLogsDir, 1, testMigrationScope, podIPv6Server)
+			results, err := parseIperfLogs(serverLogsDir, iperfIntervalSeconds, testMigrationScope, podIPv6Server)
 			Expect(err).ToNot(HaveOccurred())
 			By("Writing test results")
 			resultsJSON, err := json.MarshalIndent(results, "", " ")
