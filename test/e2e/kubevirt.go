@@ -2652,6 +2652,8 @@ spec:
 			selectedNode := workerNodes.Items[rand.Intn(len(workerNodes.Items)-1)]
 			testServerPods, err = createIperfServerPods([]corev1.Node{selectedNode}, cudnName, udnv1.NetworkRoleSecondary, podsCIDRs, func(p *corev1.Pod) {
 				p.ObjectMeta.Labels = map[string]string{"app": serverPodLabel}
+				// ensure server pod and VM are scheduled on the same node
+				p.Spec.Affinity = newPodAfinityRule(map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vm.Name})
 			})
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() {
@@ -3564,4 +3566,54 @@ func writeObjectsYamlWithCallback(kubeconf, namespace, path string, types ...str
 	}
 
 	return writeFilesFn, errors.Join(errs...)
+}
+
+// newPodAfinityRule returns Affinity with pod-affinity rule that ensure a pod
+// will schedule on the *same* node as pods with the given label key-value
+func newPodAfinityRule(labels map[string]string) *corev1.Affinity {
+	var reqs []metav1.LabelSelectorRequirement
+	for k, v := range labels {
+		reqs = append(reqs, metav1.LabelSelectorRequirement{
+			Key:      k,
+			Operator: metav1.LabelSelectorOpIn,
+			Values:   []string{v},
+		})
+	}
+	return &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: reqs,
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		},
+	}
+}
+
+// newPodAntiAfinityRule returns Affinity with pod-anti-affinity rule that ensure a pod
+// will schedule on a *diffrent* node than pods with the given label key-value
+func newPodAntiAfinityRule(labels map[string]string) *corev1.Affinity {
+	var reqs []metav1.LabelSelectorRequirement
+	for k, v := range labels {
+		reqs = append(reqs, metav1.LabelSelectorRequirement{
+			Key:      k,
+			Operator: metav1.LabelSelectorOpIn,
+			Values:   []string{v},
+		})
+	}
+	return &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: reqs,
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		},
+	}
 }
