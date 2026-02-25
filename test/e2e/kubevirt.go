@@ -329,7 +329,9 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			}
 		}
 
-		iperfBitrateStr = "11M"
+		iperfBitrateStr      = "11M"
+		iperfIntervalSeconds = 0.1
+		iperfIntervalStr     = fmt.Sprintf("%.1f", iperfIntervalSeconds)
 
 		startEastWestIperfTrafficWithClient = func(vclt *kubevirt.Client, vmi *kubevirtv1.VirtualMachineInstance, serverPodIPsByName map[string][]string, stage string) error {
 			GinkgoHelper()
@@ -337,8 +339,8 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 			polling := 15 * time.Second
 			for podName, serverPodIPs := range serverPodIPsByName {
 				for _, serverPodIP := range serverPodIPs {
-					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -b %[3]s -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
-						podName, serverPodIP, iperfBitrateStr), polling)
+					output, err := vclt.RunCommand(vmi, fmt.Sprintf("iperf3 --timestamps -V -b %[3]s -i %.1[4]f -t 0 -c %[2]s --logfile /tmp/%[1]s_%[2]s_iperf3.log &",
+						podName, serverPodIP, iperfBitrateStr, iperfIntervalSeconds), polling)
 					if err != nil {
 						return fmt.Errorf("%s: %w", output, err)
 					}
@@ -353,11 +355,11 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 
 		checkIperfTraffic = func(iperfLogFile string, execFn func(cmd string) (string, error), stage string) {
 			GinkgoHelper()
-			// Check the last line eventually show traffic flowing
-			Eventually(func() (string, error) {
+			lookupLinesCount := int(1 / iperfIntervalSeconds)
+			Eventually(func() ([]string, error) {
 				iperfLog, err := execFn("cat " + iperfLogFile)
 				if err != nil {
-					return "", err
+					return nil, err
 				}
 				// Fail fast
 				Expect(iperfLog).NotTo(ContainSubstring("iperf3: error"), stage+": "+iperfLogFile)
@@ -365,17 +367,21 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				iperfLog = strings.TrimSuffix(iperfLog, "\n")
 				iperfLogLines := strings.Split(iperfLog, "\n")
 				if len(iperfLogLines) == 0 {
-					return "", nil
+					return nil, nil
 				}
-				lastIperfLogLine := iperfLogLines[len(iperfLogLines)-1]
-				return lastIperfLogLine, nil
+				startIdx := len(iperfLogLines) - lookupLinesCount
+				if startIdx < 0 {
+					startIdx = 0
+				}
+				return iperfLogLines[startIdx:], nil
 			}).
 				WithPolling(50*time.Millisecond).
 				WithTimeout(2*time.Minute).
 				Should(
 					SatisfyAll(
-						ContainSubstring(" sec "),
-						Not(ContainSubstring("0.00 Bytes  0.00 bits/sec")),
+						HaveLen(lookupLinesCount),
+						ContainElement(ContainSubstring("sec")),
+						Not(ContainElement(ContainSubstring("0.00 Bytes  0.00 bits/sec"))),
 					),
 					stage+": failed checking iperf3 traffic at file "+iperfLogFile,
 				)
@@ -1268,7 +1274,7 @@ iface=${iface:-eth0}
 ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed -e "s#/.*##" -e "s/addr://")
 >>>>>>> 007a0e2e1 (DEBUG: e2e: Change Iperf image to enable timestamps in logs)
 if [ "$ipv4" != "" ]; then
-	iperf3 --timestamps -V -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
+	iperf3 --timestamps -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv4}_iperf3.log; then
 		cat /tmp/test_${ipv4}_iperf3.log
@@ -1287,7 +1293,7 @@ while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
 	cnt=$((cnt+1))
 done
 if [ "$ipv6" != "" ]; then
-	iperf3 --timestamps -V -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
+	iperf3 --timestamps -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv6 --logfile /tmp/test_${ipv6}_iperf3.log
 	sleep 1
 	if grep "iperf3: error" /tmp/test_${ipv6}_iperf3.log; then
 		cat /tmp/test_${ipv6}_iperf3.log 1>&2
@@ -2792,7 +2798,7 @@ spec:
 				Expect(os.WriteFile(serverLogsDir+"/"+fileName, []byte(content), 0o644)).To(Succeed())
 			}
 			By("Parse server logs")
-			results, err := parseIperfLogs(serverLogsDir, testMigrationScope, podIPv6Server)
+			results, err := parseIperfLogs(serverLogsDir, iperfIntervalSeconds, testMigrationScope, podIPv6Server)
 			Expect(err).ToNot(HaveOccurred())
 			By("Writing test results")
 			resultsJSON, err := json.MarshalIndent(results, "", " ")
@@ -3395,6 +3401,7 @@ type iperfResult struct {
 
 func parseIperfLogs(
 	logsDir string,
+	iperfIntervalSeconds float64,
 	migrationScope string,
 	ipV6Pattern string,
 ) (
@@ -3407,7 +3414,7 @@ func parseIperfLogs(
 		if cerr != nil {
 			return err
 		}
-		netDCSeconds := float64(noConnLineCount)
+		netDCSeconds := float64(noConnLineCount) * iperfIntervalSeconds
 		ipFamily := int64(4)
 		if strings.Contains(path, ipV6Pattern) {
 			ipFamily = 6
