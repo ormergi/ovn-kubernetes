@@ -640,7 +640,7 @@ install_kubevirt() {
           mirror_image_to_local_registry "quay.io/kubevirt/virt-${kv_comp}:${KUBEVIRT_VERSION}" "localhost:5000"
         done
         echo "Installing Kubevirt from registry"
-        curl -L "${kubevirt_release_url}/kubevirt-operator.yaml" | sed "s?quay.io?${KUBEVIRT_REGISTRY}?g" | kubectl apply -f -
+        curl -L "${kubevirt_release_url}/kubevirt-operator.yaml" | sed "s?quay.io?localhost:5000?g" | kubectl apply -f -
       else
         kubectl apply -f "${kubevirt_release_url}/kubevirt-operator.yaml"
       fi

@@ -374,6 +374,7 @@ var _ = Describe("Kubevirt Virtual Machines", feature.VirtualMachineSupport, fun
 				if startIdx < 0 {
 					startIdx = 0
 				}
+				fmt.Printf("DEBUG: checkIperfTraffic: lookup log lines:\n%s\n", strings.Join(iperfLogLines[startIdx:], "\n"))
 				return iperfLogLines[startIdx:], nil
 			}).
 				WithPolling(50*time.Millisecond).
@@ -1260,20 +1261,12 @@ passwd:
 		}
 
 		iperfServerScript = `
-<<<<<<< HEAD
 #!/bin/bash
 set -xe
 iface=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "eth0\|lo" | head -1| sed "s#@.*##")
 iface=${iface:-eth0}
 
 ipv4=$(ip -4 addr show dev $iface | awk '/inet / {print $2}' | sed "s#/.*##")
-=======
-#!/bin/bash -xe
-iface=$(ifconfig  |grep "Link encap:" | grep -v "eth0\|lo" | sed "s/\s.*//")
-iface=${iface:-eth0}
-
-ipv4=$(ifconfig $iface | grep "inet "|awk '{print $2}'| sed -e "s#/.*##" -e "s/addr://")
->>>>>>> 007a0e2e1 (DEBUG: e2e: Change Iperf image to enable timestamps in logs)
 if [ "$ipv4" != "" ]; then
 	iperf3 --timestamps -V -i ` + iperfIntervalStr + ` -s -D --bind $ipv4 --logfile /tmp/test_${ipv4}_iperf3.log
 	sleep 1
@@ -1285,11 +1278,7 @@ fi
 
 cnt=0
 while [ "$ipv6" == "" -a $cnt -lt 10 ]; do
-<<<<<<< HEAD
 	ipv6=$(ip -6 addr show dev $iface | awk '/inet6/ && !/fe80/ {print $2}' | sed "s#/.*##")
-=======
-	ipv6=$(ifconfig $iface | grep inet6 |grep -v fe80 |awk '{print $3}'| sed "s#/.*##")
->>>>>>> 007a0e2e1 (DEBUG: e2e: Change Iperf image to enable timestamps in logs)
 	sleep 1
 	cnt=$((cnt+1))
 done
@@ -2522,7 +2511,6 @@ chpasswd: { expire: False }
 			targetSnifferPodName       = "target-sniffer"
 			sourceSnifferPodName       = "source-sniffer"
 			snifferOutputPath          = "/tmp/tshark.pcap"
-			snifferImage               = "localhost:5000/nicolaka/netshoot:v0.14"
 
 			serverArpMonitorContainerName = "arpmonitor"
 			arpMonitorOutputPath          = "/tmp/arp.log"
@@ -2565,14 +2553,12 @@ metadata:
     app: sniffer
 spec:
   containers:
-  - args: ["tshark", "-i", "eth1", "-w", "` + snifferOutputPath + `"]
-    image: ` + snifferImage + `
+  - args: ["tshark", "-i", "eth1", "-w", "` + snifferOutputPath + `", "-P"]
+    image: ` + images.Netshoot() + `
     imagePullPolicy: IfNotPresent
     name: sniffer
-    resources: {}
     securityContext:
       privileged: true
-  enableServiceLinks: true
   hostNetwork: true
   nodeName: ` + node + `
   restartPolicy: Never
@@ -2653,7 +2639,9 @@ spec:
 			selectedNode := workerNodes.Items[rand.Intn(len(workerNodes.Items)-1)]
 			testServerPods, err = createIperfServerPods([]corev1.Node{selectedNode}, cudnName, udnv1.NetworkRoleSecondary, podsCIDRs, func(p *corev1.Pod) {
 				p.ObjectMeta.Labels = map[string]string{"app": serverPodLabel}
-				// ensure server pod and VM are scheduled on the same node
+				// By("setting pod ANTI-affinity rule for iperf server pod (pod and VM will run on DIFFERENT nodes)")
+				// p.Spec.Affinity = newPodAntiAfinityRule(map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vm.Name})
+				By("setting pod affinity rule for iperf server pod (pod and VM will run on the SAME node)")
 				p.Spec.Affinity = newPodAfinityRule(map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: vm.Name})
 			})
 			Expect(err).NotTo(HaveOccurred())
@@ -2665,14 +2653,13 @@ spec:
 
 			By("Start sniffer prob on server pod")
 			o, err := e2ekubectl.RunKubectl(namespace, "debug", testServerPods[0].Name, "-c", serverSnifferContainerName,
-				"--image", snifferImage, "--profile=netadmin", "--", "tshark", "-i", "net1", "-w", snifferOutputPath,
+				"--image", images.Netshoot(), "--profile=netadmin", "--", "tshark", "-i", "net1", "-P", "-w", snifferOutputPath,
 			)
 			Expect(err).NotTo(HaveOccurred(), "failed to start sniffer prob on server", o)
 			By("Start ARP monitoring on server pod")
-			c := fmt.Sprintf(`bash -ce 'echo "arp-monitor"; l="%s"; while true; do date --rfc-3339=ns >> $l; ip n >> $l; sleep 0.1; done & sleep 1000'`, arpMonitorOutputPath)
+			c := `echo "arp-monitor"; while true; do date --rfc-3339=ns; ip n; sleep 0.1; done | tee ` + arpMonitorOutputPath
 			o, err = e2ekubectl.RunKubectl(namespace, "debug", testServerPods[0].Name, "-c", serverArpMonitorContainerName,
-				"--image", "localhost:5000/nicolaka/netshoot", "--profile=netadmin",
-				"--", "bash", "-ce", c,
+				"--image", images.Netshoot(), "--", "bash", "-ce", c,
 			)
 			Expect(err).NotTo(HaveOccurred(), "failed to start server arp-monitor container on server pod", o)
 			Eventually(func(g Gomega) {
@@ -2814,7 +2801,7 @@ spec:
 			const maxNetworkOutageOnPostMigrationSeconds = 2
 			for _, actualNetworkOutageSeconds := range results {
 				Expect(actualNetworkOutageSeconds.Result).To(BeNumerically("<=", maxNetworkOutageOnPostMigrationSeconds),
-					fmt.Sprintf("the migrated VM had network disconnect exceed the acceptable network downtime:\n%v\n", resultsJSON))
+					fmt.Sprintf("the migrated VM had network disconnect exceed the acceptable network downtime:\n%s\n", resultsJSON))
 			}
 		},
 			Entry("after succeeded live migration", localMigrationScope, liveMigrateSucceed),
@@ -3560,15 +3547,21 @@ func writePodLogs(ctx context.Context, c kubernetes.Interface, namespace, path s
 	}
 	var errs []error
 	for _, pod := range pods.Items {
-		allContainers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
-		for _, container := range allContainers {
+		var containerNames []string
+		for _, container := range append(pod.Spec.Containers, pod.Spec.InitContainers...) {
+			containerNames = append(containerNames, container.Name)
+		}
+		for _, container := range pod.Spec.EphemeralContainers {
+			containerNames = append(containerNames, container.Name)
+		}
+		for _, containerName := range containerNames {
 			log, err := c.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				SinceTime: ptr.To(metav1.NewTime(since)), Container: container.Name,
+				SinceTime: ptr.To(metav1.NewTime(since)), Container: containerName,
 			}).DoRaw(ctx)
 			if err != nil {
 				errs = append(errs, err)
 			}
-			fileName := fmt.Sprintf("%s_%s.log", pod.Name, container.Name)
+			fileName := fmt.Sprintf("%s_%s.log", pod.Name, containerName)
 			if err := os.WriteFile(path+"/"+fileName, log, 0o644); err != nil {
 				errs = append(errs, err)
 			}

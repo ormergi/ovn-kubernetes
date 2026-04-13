@@ -100,6 +100,7 @@ for r in $(seq $RUNS); do
     export CONTAINER_RUNTIME=$OCI_BIN
     export HOST_UNDERLAY_IFACE=$underlay_iface_name
     export IPERF3_IMAGE=$LOCAL_IPERF_IMAGE
+    export NETSHOOT_IMAGE=$LOCAL_IPERF_IMAGE
     export PLATFORM_IPV4_SUPPORT=true
     export PLATFORM_IPV6_SUPPORT=true
     export ENABLE_MULTI_NET=true
