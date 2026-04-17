@@ -2592,6 +2592,12 @@ spec:
 		})
 
 		BeforeEach(func() {
+			dumpNodesOVNData(fr, "source", rootTestReportDir, "before-workloads", "", "")
+			cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
+				dumpNodesOVNData(fr, "target", rootTestReportDir, "before-workloads", "", "")
+				return nil
+			})
+
 			infraCtx = infraprovider.Get().NewTestContext()
 			startTime = time.Now()
 			By("Setup underlay network on source cluster")
@@ -2739,6 +2745,12 @@ spec:
 			Expect(startEastWestIperfTraffic(vmi, testPodsIPs, step)).To(Succeed(), step)
 			checkEastWestIperfTraffic(vmi, testPodsIPs, step)
 
+			dumpNodesOVNData(fr, "source", testReportDir, "before-mig", vmi.Status.NodeName, "")
+			cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
+				dumpNodesOVNData(fr, "target", testReportDir, "before-mig", vmi.Status.NodeName, "")
+				return nil
+			})
+
 			by(vmi.Name, "Running live migration for virtual machine instance")
 			td(vmi)
 
@@ -2752,9 +2764,11 @@ spec:
 			}()
 
 			currentVirtClient := virtClient
+			currentCrClient := crClient
 			if testMigrationScope == crossClusterMigrationScope {
 				// At this point the VM is active on the target cluster. Switch test clients to the target cluster ones.
 				currentVirtClient = targetClusterVirtClient
+				currentCrClient = targetClusterClient
 			}
 
 			step = by(vmi.Name, "Check east/west traffic after virtual machine instance live migration")
@@ -2768,6 +2782,12 @@ spec:
 			output, err = currentVirtClient.RunCommand(vmi, `pgrep -f "arp-monitor" | xargs kill`, 5*time.Second)
 			Expect(err).ToNot(HaveOccurred(), step, output)
 
+			Expect(currentCrClient.Get(context.Background(), crclient.ObjectKeyFromObject(vmi), vmi)).To(Succeed())
+			dumpNodesOVNData(fr, "source", testReportDir, "after-mig", vmi.Status.MigrationState.SourceNode, vmi.Status.MigrationState.TargetNode)
+			cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
+				dumpNodesOVNData(fr, "target", testReportDir, "after-mig", vmi.Status.MigrationState.SourceNode, vmi.Status.MigrationState.TargetNode)
+				return nil
+			})
 			logs := map[string]string{}
 			for _, pod := range testServerPods {
 				step := by(pod.Name, "Fetch server pods logs")
@@ -3254,6 +3274,112 @@ ethernets:
 		})
 	})
 })
+
+func dumpNodesOVNData(fr *e2eframework.Framework, end, dir, phase, sourceNode, targetNode string) {
+	nodes, err := fr.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Println(err)
+	}
+	for _, n := range nodes.Items {
+		nodeName := n.Name
+		if nodeName == sourceNode {
+			f := fmt.Sprintf("%s/%s/ovn-kubernetes/data/%s/lm-source__%s", dir, end, phase, nodeName)
+			if err := os.WriteFile(f, []byte{}, 0o644); err != nil {
+				fmt.Println(err)
+			}
+		}
+		if nodeName == targetNode {
+			f := fmt.Sprintf("%s/%s/ovn-kubernetes/data/%s/lm-target__%s", dir, end, phase, nodeName)
+			if err := os.WriteFile(f, []byte{}, 0o644); err != nil {
+				fmt.Println(err)
+			}
+		}
+		dumpOVNData(fr.ClientSet, end, nodeName, fmt.Sprintf("%s/%s/ovn-kubernetes/data/%s/%s", dir, end, phase, nodeName))
+	}
+}
+
+func dumpOVNData(clientSet kubernetes.Interface, cluster, nodeName, dir string) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	By("Dump SB OVN flows list from cluster " + cluster)
+	o, err := ovnKubeNodeExec(clientSet, nodeName, "ovn-sbctl", "--ovs", "--stat", "lflow-list")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/sb-lflow-list.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+
+	By("Dump OVN Flows for OVN internal bridge from cluster " + cluster)
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovs-appctl", "bridge/dump-flows", "br-int")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/appctl-flows-bridge-br-int.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+	By("Dump OVN Flows for OVN external bridge from cluster " + cluster)
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovs-appctl", "bridge/dump-flows", "breth0")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/appctl-flows-bridge-breth0.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+	By("Dump OVN Flows for localnet network underlay bridge")
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovs-appctl", "bridge/dump-flows", "ovsbr1")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/appctl-flows-bridge-ovsbr1.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+
+	By("Dump SB Logical_Flow table from cluster " + cluster)
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovn-sbctl", "list", "Logical_Flow")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/nb-logical-flows.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+	By("Dump NB Logical_Switch list from cluster " + cluster)
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovn-nbctl", "list", "Logical_Switch")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/nb-logical-switch.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+	By("Dump NB Logical_Switch_Port list from cluster " + cluster)
+	o, err = ovnKubeNodeExec(clientSet, nodeName, "ovn-nbctl", "list", "Logical_Switch_Port")
+	if err != nil {
+		fmt.Println(err)
+	}
+	if err := os.WriteFile(dir+"/nb-logical-switch-port.log", []byte(o), 0o644); err != nil {
+		fmt.Println(err)
+	}
+}
+
+func ovnKubeNodeExec(client kubernetes.Interface, nodeName string, cmd ...string) (string, error) {
+	ovnkubePods, err := client.CoreV1().Pods("ovn-kubernetes").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=ovnkube-node",
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(ovnkubePods.Items) != 1 {
+		return "", fmt.Errorf("could not find ovnkube-node for node %s", nodeName)
+	}
+
+	args := []string{"exec", "-it", ovnkubePods.Items[0].Name, "-c", "ovnkube-controller", "--"}
+	args = append(args, cmd...)
+	return e2ekubectl.RunKubectl(ovnkubePods.Items[0].Namespace, args...)
+}
 
 func ccLiveMigrateVirtualMachine(sourceClusterClient, targetClusterClient crclient.Client, namespace, vmName string) {
 	// the test assume source and target cluster has Kubeivrt certificate exchanged
