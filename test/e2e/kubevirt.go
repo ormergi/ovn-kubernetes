@@ -2601,12 +2601,18 @@ spec:
 			infraCtx = infraprovider.Get().NewTestContext()
 			startTime = time.Now()
 			By("Setup underlay network on source cluster")
-			Expect(infraCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
+			Expect(infraCtx.SetupUnderlay(fr, infraapi.Underlay{
+				LogicalNetworkName: networkName,
+				BridgeName:         deploymentconfig.Get().ExternalBridgeName(),
+			})).To(Succeed())
 			By("Setup underlay network on target cluster")
 			// SetupUnderlay relays on env clients the e2e test suite detect, which is the source cluster client.
 			// switch e2e test suite clients to use target cluster clients and setup underlay network on target cluster.
 			err := cluster_context.Exec(fr, targetClusterClientset, targetClusterKubeConf, targetClusterHost, func() error {
-				return infraCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})
+				return infraCtx.SetupUnderlay(fr, infraapi.Underlay{
+					LogicalNetworkName: networkName,
+					BridgeName:         deploymentconfig.Get().ExternalBridgeName(),
+				})
 			})
 			Expect(err).ToNot(HaveOccurred())
 
