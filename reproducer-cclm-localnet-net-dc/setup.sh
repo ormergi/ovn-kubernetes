@@ -269,7 +269,7 @@ eval set -- "$options"
 while true; do
     case "$1" in
     --cluster-up)
-        BUILD_OVN_IMAGE=1
+        # BUILD_OVN_IMAGE=1
         OPT_UP=1
         ;;
     --cluster-down)

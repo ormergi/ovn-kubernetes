@@ -106,11 +106,11 @@ for r in $(seq $RUNS); do
     export ENABLE_MULTI_NET=true
     export ENABLE_NETWORK_SEGMENTATION=true
     
-    export WHAT="Kubevirt Virtual Machines live migration with localnet udn should maintain tcp connection with minimal downtime after succeeded"
+    # export WHAT="Kubevirt Virtual Machines live migration with localnet udn should maintain tcp connection with minimal downtime after succeeded"
     # LM between nodes scenario
     # export WHAT="Kubevirt Virtual Machines live migration with localnet udn should maintain tcp connection with minimal downtime after succeeded live migration"
     # cross-cluster LM scenario
-    # export WHAT="Kubevirt Virtual Machines live migration with localnet udn should maintain tcp connection with minimal downtime after succeeded cross-cluster live migration"
+    export WHAT="Kubevirt Virtual Machines live migration with localnet udn should maintain tcp connection with minimal downtime after succeeded cross-cluster live migration"
     # LM with P-UDN L2  
     # export WHAT="Kubevirt Virtual Machines with user defined networks and persistent ips configured should keep ip after live migration of VirtualMachine with interface binding for UDN with Primary/Layer2 with snat ingress"
     make -C $TEST_DIR control-plane || true # skip error since we run test suite multiple times
