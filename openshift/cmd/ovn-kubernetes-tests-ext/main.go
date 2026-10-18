@@ -41,6 +41,7 @@ const (
 	// Feature labels used for test categorization and filtering
 	featureLabelEVPN                = "Feature:EVPN"
 	featureLabelNetworkSegmentation = "Feature:NetworkSegmentation"
+	featureLabelMACSecurity         = "Feature:MACSecurity"
 )
 
 // shouldIncludeTest determines if a test should be included based on cluster capabilities
